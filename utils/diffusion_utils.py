@@ -1,0 +1,124 @@
+import torch 
+import torch.nn as nn
+import math
+from models.AuxModels import ResidualBlock
+
+
+# ===========================================================================
+# Noise Schedules
+# ===========================================================================
+
+def cosine_beta_schedule(num_timesteps, s=0.008):
+    """Cosine noise schedule (Nichol & Dhariwal, 2021)."""
+    steps = num_timesteps + 1
+    t = torch.linspace(0, num_timesteps, steps) / num_timesteps
+    alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 0.0001, 0.9999)
+
+
+def linear_beta_schedule(num_timesteps, beta_start=1e-4, beta_end=0.02):
+    """Linear noise schedule (original DDPM)."""
+    return torch.linspace(beta_start, beta_end, num_timesteps)
+
+
+def extract(a, t, x_shape):
+    """Extract coefficients at timesteps *t*, reshaped for broadcasting."""
+    batch_size = t.shape[0]
+    out = a.gather(-1, t)
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
+
+
+# ===========================================================================
+# Sinusoidal Positional Embedding (for diffusion timestep conditioning)
+# ===========================================================================
+
+class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal positional embedding for diffusion timestep *t*."""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half = self.dim // 2
+        emb = math.log(10000) / (half - 1)
+        emb = torch.exp(torch.arange(half, device=device) * -emb)
+        emb = t[:, None].float() * emb[None, :]
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)
+
+
+# ===========================================================================
+# Conditional Denoising MLP (ε_θ network)
+# ===========================================================================
+
+class ConditionalDenoisingMLP(nn.Module):
+    """
+    Noise-prediction network ``ε_θ(a^k, o, k)`` conditioned on observation
+    features and diffusion timestep.
+
+    Also exposes *dispersive-loss hooks* — forward hooks that collect
+    intermediate features used to compute InfoNCE / Hinge dispersion
+    penalties during pre-training (D²PPO Stage 1).
+
+    Architecture
+    ------------
+    [noisy_action ⊕ obs_features ⊕ time_emb] → MLP of ``ResidualBlock``
+    layers → predicted noise ``ε``.
+    """
+
+    def __init__(self, action_dim=2, obs_feature_dim=256,
+                 time_emb_dim=32, hidden_dims=(768, 768, 768)):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim * 2),
+            nn.GELU(),
+            nn.Linear(time_emb_dim * 2, time_emb_dim),
+        )
+        input_dim = action_dim + obs_feature_dim + time_emb_dim
+        layers = []
+        in_d = input_dim
+        for h in hidden_dims:
+            layers.append(ResidualBlock(in_d, h))
+            in_d = h
+        self.mlp = nn.Sequential(*layers)
+        self.out_proj = nn.Linear(in_d, action_dim)
+
+        # --- Dispersive hook storage ---
+        self._dispersive_hooks = []
+        self._intermediate_features = []
+
+    # -- Dispersive hooks -------------------------------------------------
+
+    def register_dispersive_hooks(self):
+        """Attach forward hooks to every ``ResidualBlock`` to capture
+        intermediate activations for the dispersive loss."""
+        self.remove_dispersive_hooks()
+        for module in self.mlp:
+            if isinstance(module, ResidualBlock):
+                handle = module.register_forward_hook(self._hook_fn)
+                self._dispersive_hooks.append(handle)
+
+    def _hook_fn(self, module, input, output):
+        self._intermediate_features.append(output)
+
+    def remove_dispersive_hooks(self):
+        for h in self._dispersive_hooks:
+            h.remove()
+        self._dispersive_hooks.clear()
+        self._intermediate_features.clear()
+
+    def get_intermediate_features(self):
+        feats = list(self._intermediate_features)
+        self._intermediate_features.clear()
+        return feats
+
+    # -- Forward ----------------------------------------------------------
+
+    def forward(self, noisy_action, obs_features, t):
+        t_emb = self.time_mlp(t)
+        x = torch.cat([noisy_action, obs_features, t_emb], dim=-1)
+        x = self.mlp(x)
+        return self.out_proj(x)

@@ -1,7 +1,7 @@
 import time
 import gym
 import numpy as np
-from d2ppo_agent import PPOAgent
+from ppo_agent import PPOAgent
 from utils.control_handler import ControlHandler
 from baselines.pure_pursuit import PurePursuit
 from utils.utils import *

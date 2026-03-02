@@ -8,8 +8,6 @@ import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
-from torchrl.data import TensorDictReplayBuffer, ListStorage
-from torchrl.modules import ProbabilisticActor
 from torch.distributions import Normal
 from models import *
 from utils.utils import to_birds_eye

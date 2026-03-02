@@ -1,6 +1,7 @@
 .*/
 _*/
-models/*
+models/actor/*
+models/critic/*
 */map_results/
 *.pkl
 *.whl
