@@ -3,3 +3,4 @@ _*/
 models/*
 */map_results/
 *.pkl
+*.whl
