@@ -1,3 +1,8 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class CriticNetwork(nn.Module):
     """
     LSTM-enhanced value network with downsampled temporal memory.
@@ -8,11 +13,6 @@ class CriticNetwork(nn.Module):
         state_dim=4, 
         encoder=None,
         d_model=256,
-        d_state=16,
-        d_conv=4,
-        d_head=16,
-        expand=2,
-        num_layers=4,
         memory_length=48,    # Sequence length
         odom_expand=64
         ):
@@ -32,24 +32,6 @@ class CriticNetwork(nn.Module):
         # Odom handling
         self.odom_expand = nn.Linear(state_dim, odom_expand)
         self.norm_layer = nn.LayerNorm(self.feature_input_size)
-        
-        # Feature projection
-        # self.feature_projection = nn.Sequential(
-        #     nn.Linear(self.feature_input_size, 768),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(768, d_model),
-        #     nn.ReLU()
-        # )
-        
-        # Mamba for temporal modeling
-        # self.mamba = Mamba2Simple(
-        #         d_model=d_model,
-        #         d_state=d_state,
-        #         d_conv=d_conv,
-        #         headdim=d_head,
-        #         expand=expand
-        # )
         
         # Value head (maps LSTM output to state value) - Adjusted for larger hidden size
         self.fc_layers = nn.Sequential(

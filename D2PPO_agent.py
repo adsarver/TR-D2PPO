@@ -27,7 +27,6 @@ from tensordict import TensorDict
 from torchrl.data import TensorDictReplayBuffer, ListStorage
 from models.AuxModels import VisionEncoder, ResidualBlock
 from models.CriticNetworks import CriticNetwork
-from models.DiffusionMamba2 import DiffusionMamba2
 from models.DiffusionLSTM import DiffusionLSTM
 from utils.utils import to_birds_eye
 
@@ -213,7 +212,6 @@ class D2PPOAgent:
             action_dim=2,
             encoder=actor_encoder,
             num_diffusion_steps=num_diffusion_steps,
-            obs_feature_dim=512,
             time_emb_dim=32,
             hidden_dims=(768, 768, 768),
             beta_schedule=beta_schedule,
@@ -261,6 +259,16 @@ class D2PPOAgent:
         ]
         self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
         self.generation_counter = 0
+
+        # --- LSTM temporal state (matches ppo_agent.py pattern) ---
+        self.actor_buffer = deque(
+            [self.actor_network.create_observation_buffer(self.num_agents, self.device)],
+            maxlen=2,
+        )
+        # Hidden states stored as (hidden_h, hidden_c), each (B, num_layers, H)
+        self.actor_hidden = self.actor_network.get_init_hidden(
+            self.num_agents, self.device, transpose=True
+        )
 
     # -------------------------------------------------------------------
     # Buffer / utility methods (same interface as PPOAgent)
@@ -339,8 +347,28 @@ class D2PPOAgent:
         return scan_tensors.to(self.device), state_tensor.to(self.device)
 
     def reset_buffers(self, agent_indices=None):
-        """No recurrent state to reset for diffusion policy (memoryless)."""
-        pass
+        """Reset LSTM hidden states and observation buffers."""
+        if agent_indices is None:
+            # Full reset for all agents
+            self.actor_buffer = deque(
+                [self.actor_network.create_observation_buffer(self.num_agents, self.device)],
+                maxlen=2,
+            )
+            self.actor_hidden = self.actor_network.get_init_hidden(
+                self.num_agents, self.device, transpose=True
+            )
+        else:
+            agent_indices = agent_indices[agent_indices < self.num_agents]
+            # Per-agent reset: zero out specific agent slots
+            if self.actor_buffer[-1] is not None:
+                for idx in agent_indices:
+                    self.actor_buffer[-1][idx] = 0.0
+            # Zero out hidden states for specific agents
+            h, c = self.actor_hidden
+            for idx in agent_indices:
+                h[idx] = 0.0
+                c[idx] = 0.0
+            self.actor_hidden = (h, c)
 
     # -------------------------------------------------------------------
     # Action selection
@@ -352,17 +380,22 @@ class D2PPOAgent:
         
         Compatible with PPOAgent interface: returns (action, log_prob, value).
         
-        During data collection we store the full denoising chain so we can
-        recompute per-step log-probs during PPO updates.
+        When ``store=True`` the LSTM hidden states and observation buffer are
+        advanced (used during rollout collection).  When ``store=False`` we
+        only need the value estimate (e.g. for bootstrapping next-state value)
+        and the temporal state is left untouched.
         """
         self.actor_network.eval()
         self.critic_network.eval()
 
         with torch.no_grad():
-            # Encode observation
-            obs_features = self.actor_network.encode_observation(
+            # Encode observation through CNN + LSTM
+            obs_features, new_buffer, new_h, new_c = self.actor_network.encode_observation(
                 scan_tensor[: self.num_agents],
                 state_tensor[: self.num_agents],
+                self.actor_buffer[-1],
+                self.actor_hidden[0],
+                self.actor_hidden[1],
             )
 
             # Sample action via full reverse diffusion
@@ -370,11 +403,16 @@ class D2PPOAgent:
                 obs_features, deterministic=deterministic
             )
 
-            # Value estimate
+            # Value estimate (critic is feedforward — no temporal state)
             value = self.critic_network(
                 scan_tensor[: self.num_agents],
                 state_tensor[: self.num_agents],
             )
+
+            # Advance temporal state only during rollout collection
+            if store:
+                self.actor_buffer = new_buffer
+                self.actor_hidden = (new_h, new_c)
 
         return action, log_prob, value
 
@@ -592,14 +630,24 @@ class D2PPOAgent:
             self.actor_optimizer.zero_grad()
             update_counter = 0
 
+            # Reset temporal state at the start of each epoch
+            demo_buffer_obs = None
+            demo_hidden = (None, None)
+
             for i, d in enumerate(demo_buffer):
                 # Prepare single-sample batch
                 scan = torch.from_numpy(d["scan"]).float().unsqueeze(0).to(self.device)
                 state = torch.from_numpy(d["state"]).float().unsqueeze(0).to(self.device)
                 action = torch.from_numpy(d["action"]).float().unsqueeze(0).to(self.device)
 
-                # Encode observation
-                obs_features = self.actor_network.encode_observation(scan, state)
+                # Encode observation (track LSTM state across sequential demos)
+                obs_features, demo_buffer_obs, demo_h, demo_c = self.actor_network.encode_observation(
+                    scan, state, demo_buffer_obs, demo_hidden[0], demo_hidden[1]
+                )
+
+                # Detach temporal state to prevent backprop through entire sequence
+                demo_buffer_obs = demo_buffer_obs.detach()
+                demo_hidden = (demo_h.detach(), demo_c.detach())
 
                 # --- Diffusion loss ---
                 diff_loss = self.actor_network.compute_diffusion_loss(action, obs_features)
@@ -750,8 +798,11 @@ class D2PPOAgent:
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
 
-                # --- Encode observations ---
-                obs_features = self.actor_network.encode_observation(obs_scan, obs_state)
+                # --- Encode observations (no temporal continuity in shuffled minibatches) ---
+                obs_features, _, _, _ = self.actor_network.encode_observation(
+                    obs_scan, obs_state, obs_buffer=None,
+                    hidden_h=None, hidden_c=None,
+                )
 
                 # --- Critic value prediction ---
                 predicted_values = self.critic_network(obs_scan, obs_state)

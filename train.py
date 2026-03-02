@@ -1,8 +1,8 @@
 import time
 import gym
 import numpy as np
-from ppo_agent import PPOAgent
-from utils.control_handler import ControlHandler
+from D2PPO_agent import D2PPOAgent as PPOAgent
+# from utils.control_handler import ControlHandler
 from baselines.pure_pursuit import PurePursuit
 from utils.utils import *
 import torch
@@ -32,11 +32,11 @@ params_dict = {'mu': 1.0489,
 NUM_AGENTS_AI = 8
 NUM_AGENTS_PP = 4
 NUM_AGENTS = NUM_AGENTS_AI + NUM_AGENTS_PP
-EASY_MAPS = ["Hockenheim", "Monza", "Melbourne"]
+EASY_MAPS = ["Hockenheim", "Monza", "Melbourne", "BrandsHatch"]
 MEDIUM_MAPS = ["Oschersleben", "Sakhir", "Sepang", "SaoPaulo", "Budapest", "Catalunya", "Silverstone"]
 HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Austin", "Nuerburgring", "Spa", "YasMarina", "Sochi",]
 TOTAL_TIMESTEPS = 12_000_000
-STEPS_PER_GENERATION = 512
+STEPS_PER_GENERATION = 1024
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = None # Generated later
@@ -61,7 +61,7 @@ env = gym.make(
 # --- Agent Setup ---
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 
-ORIGINAL_WEIGHT = "actor_LSTM_Avoid.pt"
+ORIGINAL_WEIGHT = None
 ACTOR_CHECKPOINT = f"models/actor/best/actor_gen_93.pt"
 CRITIC_CHECKPOINT = f"models/critic/best/critic_gen_93.pt"
 
@@ -70,7 +70,7 @@ agent = PPOAgent(
     map_name=CURRENT_MAP,
     steps=STEPS_PER_GENERATION,
     params=params_dict,
-    transfer=[ORIGINAL_WEIGHT, None]  # Fresh critic - old one is corrupted
+    transfer=[ORIGINAL_WEIGHT, None]
 )
 pp_driver = PurePursuit(
     map_name=CURRENT_MAP,
@@ -81,7 +81,7 @@ pp_driver = PurePursuit(
     min_speed=1.5
 )
 
-STEPS_PER_GENERATION = int((agent.raceline_length / 7) * 80)
+STEPS_PER_GENERATION = int((agent.raceline_length / 7) * 100)
 agent.update_buffer_size(STEPS_PER_GENERATION)
 print(f"Adjusted steps per generation to {STEPS_PER_GENERATION} based on raceline length.")
 
@@ -96,40 +96,6 @@ print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 
 # Render first to create the window/renderer
 env.render(mode="human")
-
-# --- Control Handler Setup (must be after render) ---
-# Set use_gamepad=True to enable controller support (requires 'inputs' package)
-control_handler = ControlHandler(
-    env, CURRENT_MAP,
-    params_dict,
-    max_demo_buffer=10000,
-    use_gamepad=True,
-    load_map="BrandsHatch"
-)
-
-agent.demo_buffer = control_handler.demonstration_buffer
-
-if control_handler.demonstration_buffer is not None and len(control_handler.demonstration_buffer) > 1000:
-        print(f"\nUsing {len(control_handler.demonstration_buffer)} demonstrations for supervised learning...")
-        agent.pretrain_from_demonstrations(control_handler.demonstration_buffer, epochs=5, gradient_accumulation_steps=1)
-        control_handler.reset_pretrain_mode()
-        
-        CURRENT_MAP = EASY_MAPS[0]
-        print(f"Switching to easier map {CURRENT_MAP} for initial training.")
-        INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
-        env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
-        
-        agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = agent._load_waypoints(CURRENT_MAP)
-        agent.last_cumulative_distance = np.zeros(agent.num_agents) 
-        agent.last_wp_index = np.zeros(agent.num_agents, dtype=np.int32)
-        
-        obs, timestep, _, _ = env.reset(poses=INITIAL_POSES)
-        agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
-        agent.reset_buffers()
-        control_handler.update_map(CURRENT_MAP)
-        print("Returning to normal RL training.\n")
-else:
-    EASY_MAPS.append("BrandsHatch")
 
 best_avg_reward = -float('inf')
 patience = 0
@@ -154,11 +120,6 @@ for gen in range(num_generations):
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)
         action_tensor, log_prob_tensor, value_tensor = agent.get_action_and_value(
             scan_tensors, state_tensor
-        )
-                
-        # --- Human Control Override ---
-        action_tensor = control_handler.override_action(
-            action_tensor
         )
                 
         # Convert to NumPy for the Gym environment
@@ -207,15 +168,6 @@ for gen in range(num_generations):
             collisions += len(agents_to_reset[agents_to_reset < NUM_AGENTS_AI])
             
             done_np[agents_to_reset] = 1  # Mark these agents as done for this step
-        
-        # --- Store Human Demonstrations (with reward values for critic pretraining) ---
-        control_handler.store_demonstration(
-            scan_tensors,
-            state_tensor,
-            action_tensor,
-            next_obs['collisions'],
-            rewards_list
-        )
         
         total_reward_this_gen.append(avg_reward)
         ego_reward_this_gen.append(rewards_list[0])
@@ -270,26 +222,8 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
         patience += 1
         print(f"No improvement in average reward {reward_avg:.3f} vs {best_avg_reward:.3f}. Patience: {patience}")
         
-    # --- Pretrain from Demonstrations if Available ---
-    if control_handler.should_pretrain():
-        print(f"\n🎯 Using {len(control_handler.demonstration_buffer)} demonstrations for supervised learning...")
-        agent.pretrain_from_demonstrations(control_handler.demonstration_buffer)
-        control_handler.save_demonstrations()
-        control_handler.reset_pretrain_mode()
-        print("Returning to normal RL training.\n")
-        # Increment generation counter to keep sync with loop counter
-        agent.generation_counter += 1
-    else:
-        agent.learn(collisions, reward_avg)
-        
-        INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
-        
-        next_obs, _, _, _ = env.reset(poses=INITIAL_POSES)
-        
-        # Reset agent buffers and trackers
-        agent.reset_buffers()
-        agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
-        
+    agent.learn(collisions, reward_avg)
+    
         
     # if patience >= PATIENCE:
     #     print("Early stopping triggered due to no improvement.")
@@ -323,15 +257,11 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
         agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
         agent.reset_buffers()
         
-        # Update control handler with new map
-        control_handler.update_map(CURRENT_MAP)
-        
 
-torch.save(agent.actor_module.module.state_dict(), f"models/actor/checkpoint/actor_gen_FINAL.pt")
-torch.save(agent.critic_module.module.state_dict(), f"models/critic/checkpoint/critic_gen_FINAL.pt")
+torch.save(agent.actor_network.state_dict(), f"models/actor/checkpoint/actor_gen_FINAL.pt")
+torch.save(agent.critic_network.state_dict(), f"models/critic/checkpoint/critic_gen_FINAL.pt")
 print(f"Checkpoint saved at final generation.")
         
 # --- END OF TRAINING ---
-control_handler.cleanup()
 env.close()
 print("Training complete.")

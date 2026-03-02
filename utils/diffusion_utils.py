@@ -92,13 +92,39 @@ class ConditionalDenoisingMLP(nn.Module):
 
     # -- Dispersive hooks -------------------------------------------------
 
-    def register_dispersive_hooks(self):
-        """Attach forward hooks to every ``ResidualBlock`` to capture
-        intermediate activations for the dispersive loss."""
+    def register_dispersive_hooks(self, layer_indices=None):
+        """Attach forward hooks to selected ``ResidualBlock`` layers to capture
+        intermediate activations for the dispersive loss.
+
+        Args:
+            layer_indices: Which residual blocks to hook.
+                ``None``  → hook **all** blocks.
+                ``"early"`` / ``"mid"`` / ``"late"`` → convenience shortcuts.
+                ``int`` or ``list[int]`` → explicit block indices.
+        """
         self.remove_dispersive_hooks()
-        for module in self.mlp:
-            if isinstance(module, ResidualBlock):
-                handle = module.register_forward_hook(self._hook_fn)
+        res_blocks = [m for m in self.mlp if isinstance(m, ResidualBlock)]
+        n = len(res_blocks)
+        if n == 0:
+            return
+
+        # Resolve convenience strings
+        if layer_indices is None:
+            indices = list(range(n))
+        elif layer_indices == "early":
+            indices = [0]
+        elif layer_indices == "mid":
+            indices = [n // 2]
+        elif layer_indices == "late":
+            indices = [n - 1]
+        elif isinstance(layer_indices, int):
+            indices = [layer_indices]
+        else:
+            indices = list(layer_indices)
+
+        for idx in indices:
+            if 0 <= idx < n:
+                handle = res_blocks[idx].register_forward_hook(self._hook_fn)
                 self._dispersive_hooks.append(handle)
 
     def _hook_fn(self, module, input, output):

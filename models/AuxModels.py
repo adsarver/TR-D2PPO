@@ -1,4 +1,3 @@
-# model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -234,60 +233,3 @@ class VisionEncoder(nn.Module):
             return features
         else:
             return self.conv_layers(scan_tensor)
-
-
-    def forward(self, scan_tensor, state_tensor, obs_buffer, hidden_h, hidden_c):
-        """
-        Args:
-            scan_tensor: (batch, 1, lidar_beams) - Current observation
-            state_tensor: (batch, state_dim) - Current state
-            obs_buffer: (batch, memory_length, lstm_hidden_size) - Historical features buffer
-            hidden: Optional LSTM hidden state tuple (h, c)
-        Returns:
-            loc, scale: Action distribution parameters
-            obs_buffer: Updated observation buffer (shifted + new observation)
-            hidden: Updated LSTM hidden state (for next step)
-        """
-        batch_size = scan_tensor.shape[0]
-        device = scan_tensor.device
-        # Update batch_size after potential reshaping
-        batch_size = scan_tensor.shape[0]
-        
-        # Initialize buffers if not provided
-        if obs_buffer is None:
-            obs_buffer = self.create_observation_buffer(batch_size, device)
-        if hidden_h is None or hidden_c is None:
-            hidden = self.get_init_hidden(batch_size, device)
-        else:
-            # Transpose hidden from [batch, num_layers, hidden] to [num_layers, batch, hidden]
-            hidden = (hidden_h.transpose(0, 1).contiguous(), hidden_c.transpose(0, 1).contiguous())
-        
-        # CNN feature extraction and concatenation
-        vision_features = self.conv_layers(scan_tensor)
-        combined_features = torch.cat((vision_features, state_tensor), dim=1)
-        
-        # Project to LSTM input size
-        current_feature = self.feature_projection(combined_features)
-        
-        # Update observation buffer (shift left, add new observation at end)
-        obs_buffer_updated = torch.cat([
-            obs_buffer[:, 1:, :],  # Drop oldest observation
-            current_feature.unsqueeze(1)  # Add newest observation
-        ], dim=1)
-        
-        # LSTM forward pass on observation sequence
-        lstm_out, hidden_new = self.lstm(obs_buffer_updated, hidden)
-        lstm_final = lstm_out[:, -1, :]
-        
-        # Policy head
-        x = self.fc_layers(lstm_final)
-        loc = self.mean_head(x)
-        log_std = self.log_std_head(x)
-        log_std = torch.clamp(log_std, -2.0, 2.0)  # Prevent scale collapse: min=exp(-2)≈0.135 (more exploration)
-        scale = torch.exp(log_std)
-        scale = torch.clamp(scale, min=0.1, max=10.0)  # Higher floor for pretrained model exploration
-        
-        # Transpose hidden states from [num_layers, batch, hidden] to [batch, num_layers, hidden]
-        hidden_transposed = (hidden_new[0].transpose(0, 1).contiguous(), hidden_new[1].transpose(0, 1).contiguous())
-        
-        return loc, scale, obs_buffer_updated, hidden_transposed[0], hidden_transposed[1]

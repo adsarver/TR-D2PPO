@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torch.distributions import Normal
 from models import *
+from models.AuxModels import VisionEncoder
 from utils.utils import to_birds_eye
 import time
 
