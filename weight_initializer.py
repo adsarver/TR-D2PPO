@@ -220,7 +220,7 @@ def pretrain(
     lr: float = 3e-4,
     dispersive_lambda: float = 0.5,
     dispersive_temperature: float = 0.5,
-    num_diffusion_steps: int = 25,
+    num_diffusion_steps: int = 10,
     gradient_accumulation_steps: int = 1,
     save_dir: str = "models/actor/pretrained",
     save_name: str = "actor_pretrained.pt",
@@ -241,14 +241,16 @@ def pretrain(
             state_dim=STATE_DIM,
             action_dim=2,
             num_diffusion_steps=num_diffusion_steps,
+            inference_steps=5,
             time_emb_dim=32,
-            hidden_dims=(512, 512, 512),
+            hidden_dims=(256, 256),
             beta_schedule="cosine",
-            odom_expand=64,
-            lstm_hidden_size=256,
+            odom_expand=32,
+            proj_hidden=384,
+            lstm_hidden_size=128,
             lstm_num_layers=2,
-            memory_length=350,
-            memory_stride=20
+            memory_length=64,
+            memory_stride=4
         ).to(device)
 
     # Register dispersive hooks on the denoising MLP (last block)
@@ -395,7 +397,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--dispersive_lambda", type=float, default=0.1)
-    parser.add_argument("--num_diffusion_steps", type=int, default=25)
+    parser.add_argument("--num_diffusion_steps", type=int, default=10)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
     # Output
     parser.add_argument("--save_dir", type=str, default="models/actor/pretrained")

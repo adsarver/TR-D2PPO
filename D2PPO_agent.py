@@ -41,7 +41,7 @@ class D2PPOAgent:
         params,
         transfer=(None, None),
         # Diffusion config
-        num_diffusion_steps=25,
+        num_diffusion_steps=10,
         beta_schedule="cosine",
         # PPO diffusion config
         ppo_sample_steps=2,               # |S| – number of denoising steps to sample per PPO update
@@ -61,8 +61,8 @@ class D2PPOAgent:
         self.num_scan_beams = 1080
         self.lidar_fov = 4.7
         self.image_size = 256
-        self.minibatch_size = 512
-        self.epochs = 10              # Table 6: 10 PPO epochs
+        self.minibatch_size = 256
+        self.epochs = 6               # Reduced for faster iteration
         self.params = params
 
         # --- Diffusion config ---
@@ -95,14 +95,16 @@ class D2PPOAgent:
             action_dim=2,
             encoder=actor_encoder,
             num_diffusion_steps=num_diffusion_steps,
+            inference_steps=5,          # DDIM fast sampling for rollout/deploy
             time_emb_dim=32,
-            hidden_dims=(512, 512, 512),
+            hidden_dims=(256, 256),
             beta_schedule=beta_schedule,
-            odom_expand=64,
-            lstm_hidden_size=256,
+            odom_expand=32,
+            proj_hidden=384,
+            lstm_hidden_size=128,
             lstm_num_layers=2,
-            memory_length=350,
-            memory_stride=20
+            memory_length=64,            # was 350
+            memory_stride=4              # was 20
         ).to(self.device)
 
         # Critic (same as PPOAgent – not diffusion-based)
@@ -289,6 +291,16 @@ class D2PPOAgent:
         self.critic_network.eval()
 
         with torch.no_grad():
+            # Value estimate (critic is feedforward — no temporal state)
+            value = self.critic_network(
+                scan_tensor[: self.num_agents],
+                state_tensor[: self.num_agents],
+            )
+
+            if not store:
+                # Bootstrapping: only value needed — skip diffusion entirely
+                return None, None, value
+
             # Encode observation through CNN + LSTM
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 obs_features, new_buffer, new_h, new_c = self.actor_network.encode_observation(
@@ -299,21 +311,14 @@ class D2PPOAgent:
                     self.actor_hidden[1],
                 )
 
-                # Sample action via full reverse diffusion
+                # Sample action via full reverse diffusion (with inline log_prob)
                 action, chain, log_prob = self.actor_network.sample_action_with_chain(
                     obs_features, deterministic=deterministic
                 )
 
-            # Value estimate (critic is feedforward — no temporal state)
-            value = self.critic_network(
-                scan_tensor[: self.num_agents],
-                state_tensor[: self.num_agents],
-            )
-
-            # Advance temporal state only during rollout collection
-            if store:
-                self.actor_buffer.append(new_buffer)
-                self.actor_hidden = (new_h, new_c)
+            # Advance temporal state
+            self.actor_buffer.append(new_buffer)
+            self.actor_hidden = (new_h, new_c)
 
         return action, log_prob, value
 

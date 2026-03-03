@@ -46,6 +46,7 @@ class DiffusionLSTM(nn.Module):
         action_dim=2,
         encoder=None,
         num_diffusion_steps=50,
+        inference_steps=0,          # DDIM steps for fast inference (0 = use full DDPM)
         time_emb_dim=32,
         hidden_dims=(768, 768, 768),
         beta_schedule="cosine",
@@ -55,6 +56,7 @@ class DiffusionLSTM(nn.Module):
         memory_length=5,
         memory_stride=5,
         odom_expand=64,
+        proj_hidden=768,            # Feature projection intermediate dim
         # Action normalisation range  (raw env units → [-1, 1])
         action_low=(-0.34, 0.0),     # (min_steering, min_speed)
         action_high=(0.34, 10.0),     # (max_steering, max_speed)
@@ -62,6 +64,7 @@ class DiffusionLSTM(nn.Module):
         super().__init__()
         self.action_dim = action_dim
         self.num_diffusion_steps = num_diffusion_steps
+        self.inference_steps = inference_steps  # 0 → fall back to num_diffusion_steps
         self.obs_feature_dim = lstm_hidden_size   # LSTM output == obs embedding dim
         self.lstm_hidden_size = lstm_hidden_size
         self.lstm_num_layers = lstm_num_layers
@@ -102,10 +105,10 @@ class DiffusionLSTM(nn.Module):
         # --- Feature projection (CNN+odom → lstm_hidden_size) ---
         feature_input_size = conv_output_size + odom_expand
         self.feature_projection = nn.Sequential(
-            nn.Linear(feature_input_size, 768),
+            nn.Linear(feature_input_size, proj_hidden),
             nn.LeakyReLU(),
             nn.Dropout(0.1),
-            nn.Linear(768, lstm_hidden_size),
+            nn.Linear(proj_hidden, lstm_hidden_size),
             nn.LeakyReLU(),
         )
 
@@ -294,8 +297,67 @@ class DiffusionLSTM(nn.Module):
         nonzero_mask = (t != 0).float().reshape(-1, *([1] * (len(x_t.shape) - 1)))
         return mean + nonzero_mask * torch.sqrt(var) * noise
 
+    def _ddim_timestep_schedule(self, num_steps=None):
+        """Return evenly-spaced timestep indices for DDIM sub-sampling."""
+        K = self.num_diffusion_steps
+        S = num_steps or self.inference_steps or K
+        S = min(S, K)
+        if S == K:
+            return list(range(K - 1, -1, -1))
+        # Evenly spaced, always including step 0
+        step_size = K / S
+        return [int(round((S - 1 - i) * step_size)) for i in range(S)]
+
+    @torch.no_grad()
+    def ddim_sample_action(self, obs_features, num_steps=None, eta=0.0):
+        """
+        Fast DDIM sampling.  Uses the *same* trained noise schedule but
+        skips intermediate timesteps for much fewer MLP forwards.
+
+        Args:
+            obs_features:  (B, obs_feature_dim)
+            num_steps:     Override for number of DDIM steps (default: self.inference_steps)
+            eta:           Stochasticity (0 = deterministic DDIM, 1 ≈ DDPM)
+        """
+        B = obs_features.shape[0]
+        device = obs_features.device
+        schedule = self._ddim_timestep_schedule(num_steps)
+
+        x = torch.randn(B, self.action_dim, device=device)
+        for i, t_curr in enumerate(schedule):
+            t = torch.full((B,), t_curr, device=device, dtype=torch.long)
+            pred_noise = self.predict_noise(x, obs_features, t)
+
+            alpha_t = extract(self.alphas_cumprod, t, x.shape)
+            x_0_pred = ((x - torch.sqrt(1.0 - alpha_t) * pred_noise)
+                        / torch.sqrt(alpha_t).clamp(min=1e-8))
+            x_0_pred = x_0_pred.clamp(-1.0, 1.0)
+
+            if i + 1 < len(schedule):
+                t_next = schedule[i + 1]
+                alpha_next = self.alphas_cumprod[t_next]
+            else:
+                alpha_next = torch.tensor(1.0, device=device)  # α_0 = 1
+
+            # DDIM update
+            if eta > 0 and t_curr > 0:
+                sigma = (eta * torch.sqrt((1 - alpha_next) / (1 - alpha_t).clamp(min=1e-8)
+                         * (1 - alpha_t / alpha_next.clamp(min=1e-8))))
+                dir_xt = torch.sqrt((1 - alpha_next - sigma ** 2).clamp(min=0)) * pred_noise
+                x = torch.sqrt(alpha_next) * x_0_pred + dir_xt + sigma * torch.randn_like(x)
+            else:
+                dir_xt = torch.sqrt((1 - alpha_next).clamp(min=0)) * pred_noise
+                x = torch.sqrt(alpha_next) * x_0_pred + dir_xt
+
+        return self.denormalize_action(x.clamp(-1.0, 1.0))
+
     @torch.no_grad()
     def sample_action(self, obs_features, deterministic=False):
+        """Sample action using DDIM (fast) if inference_steps > 0, else full DDPM."""
+        if self.inference_steps > 0:
+            return self.ddim_sample_action(
+                obs_features, eta=0.0 if deterministic else 0.3
+            )
         B = obs_features.shape[0]
         device = obs_features.device
         x = torch.randn(B, self.action_dim, device=device)
@@ -356,27 +418,45 @@ class DiffusionLSTM(nn.Module):
                 obs_features, t)
         return total
 
-    # ------------------------------------------------------------------
-    # Sample with chain (for PPO data collection)
-    # ------------------------------------------------------------------
 
     def sample_action_with_chain(self, obs_features, deterministic=False):
+        """
+        Sample action via full DDPM reverse process, computing chain log-prob
+        *inline* to avoid a redundant second pass through the denoising MLP.
+        """
         B = obs_features.shape[0]
         device = obs_features.device
         x = torch.randn(B, self.action_dim, device=device)
         chain = [x.clone()]
+        log_prob_accum = torch.zeros(B, device=device)
+
         for k in reversed(range(self.num_diffusion_steps)):
             t = torch.full((B,), k, device=device, dtype=torch.long)
-            if deterministic:
-                mean, _, _ = self.p_mean_variance(x, obs_features, t)
-                x = mean
+            # p_mean_variance already calls predict_noise once —
+            # reuse mean & var for both the sample and the log-prob.
+            mean, var, _ = self.p_mean_variance(x, obs_features, t)
+
+            if deterministic or k == 0:
+                x_prev = mean
             else:
-                x = self.p_sample(x, obs_features, t)
+                noise = torch.randn_like(x)
+                x_prev = mean + torch.sqrt(var) * noise
+
+            # Accumulate log p(x_{k-1} | x_k, obs) inline
+            if k > 0:
+                var_c = var.clamp(min=1e-6)
+                step_lp = -0.5 * (
+                    (x_prev - mean) ** 2 / var_c
+                    + torch.log(var_c)
+                    + math.log(2 * math.pi)
+                )
+                log_prob_accum = log_prob_accum + step_lp.sum(dim=-1)
+
+            x = x_prev
             chain.append(x.clone())
-        log_prob = self.compute_chain_log_prob(chain, obs_features)
-        
+
         # chain lives in normalised [-1,1] space; clamp and return raw action
-        return self.denormalize_action(chain[-1].clamp(-1.0, 1.0)), chain, log_prob
+        return self.denormalize_action(chain[-1].clamp(-1.0, 1.0)), chain, log_prob_accum
 
     # ------------------------------------------------------------------
     # Convenience forward (matches ExampleNetwork / HybridLSTM signature)
