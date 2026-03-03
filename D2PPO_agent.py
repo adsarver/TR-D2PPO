@@ -10,6 +10,7 @@ supervised / BC pre-training or dispersive loss.
 """
 
 from collections import deque
+import math
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,10 +20,30 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tensordict import TensorDict
 from torchrl.data import TensorDictReplayBuffer, ListStorage
-from models.AuxModels import VisionEncoder, ResidualBlock
+from baselines.gap_follow_pure_pursuit import GapFollowPurePursuit
+from models.AuxModels import VisionEncoder
 from models.CriticNetworks import CriticNetwork
 from models.DiffusionLSTM import DiffusionLSTM
-from utils.utils import to_birds_eye
+
+
+# ── Dispersive loss (InfoNCE-L2) ─────────────────────────────────────
+def dispersive_loss_infonce_l2(features, temperature=0.5):
+    """InfoNCE-style contrastive loss on L2-normalised features.
+
+    Encourages intermediate denoiser representations to spread on the unit
+    hyper-sphere, preventing mode collapse during RL fine-tuning.
+    """
+    B = features.shape[0]
+    if B < 2:
+        return torch.tensor(0.0, device=features.device)
+    features = F.normalize(features, dim=-1)
+    diff = features.unsqueeze(0) - features.unsqueeze(1)
+    sq_dist = (diff ** 2).sum(dim=-1)
+    mask = ~torch.eye(B, dtype=torch.bool, device=features.device)
+    sq_dist_masked = sq_dist[mask].reshape(B, B - 1)
+    log_exp = -sq_dist_masked / temperature
+    loss = torch.logsumexp(log_exp.reshape(-1), dim=0) - math.log(B * (B - 1))
+    return loss
 
 
 class D2PPOAgent:
@@ -43,31 +64,41 @@ class D2PPOAgent:
         # Diffusion config
         num_diffusion_steps=10,
         beta_schedule="cosine",
-        # PPO diffusion config
-        ppo_sample_steps=2,               # |S| – number of denoising steps to sample per PPO update
     ):
         # --- Hyperparameters ---
-        torch.autograd.set_detect_anomaly(True)
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lr_actor = 3e-5
         self.lr_critic = 1e-4
         self.gamma = 0.999            # Paper uses 0.999 (Table 6)
         self.gae_lambda = 0.95
-        self.clip_epsilon = 0.1       # PPO clip (Table 6)
+        self.clip_epsilon = 0.2       # Value-clipping range for critic
         self.max_grad_norm_actor = 0.5
         self.max_grad_norm_critic = 1.0
         self.state_dim = 4
         self.num_scan_beams = 1080
         self.lidar_fov = 4.7
         self.image_size = 256
-        self.minibatch_size = 256
+        self.minibatch_size = 128
         self.epochs = 6               # Reduced for faster iteration
         self.params = params
+        self.gfpp = GapFollowPurePursuit(
+            map_name=map_name,
+            wheelbase=params['lf'] + params['lr'],
+            max_steering=params['s_max'],
+            max_speed=8.0,
+            min_speed=1.5,
+            num_beams=self.num_scan_beams,
+            fov=self.lidar_fov,
+        )
 
-        # --- Diffusion config ---
+        # --- Advantage-weighted diffusion config ---
         self.num_diffusion_steps = num_diffusion_steps
-        self.ppo_sample_steps = ppo_sample_steps
+        self.awr_temperature = 5.0    # β for exp(A/β) advantage weighting
+        self.awr_max_weight = 20.0    # Clamp max weight for stability
+        self.diff_reg_lambda = 1.0    # Unweighted diffusion MSE regulariser
+        self.dispersive_lambda = 0.1  # Dispersive loss weight (same as pretrain default)
+        self.dispersive_temperature = 0.5
 
         # --- Waypoints for Raceline Reward ---
         self.waypoints_xy, self.waypoints_s, self.raceline_length = self._load_waypoints(map_name)
@@ -107,6 +138,9 @@ class D2PPOAgent:
             memory_stride=4              # was 20
         ).to(self.device)
 
+        # Register dispersive hooks on last denoiser block (same as pretraining)
+        self.actor_network.denoise_net.register_dispersive_hooks("late")
+
         # Critic (same as PPOAgent – not diffusion-based)
         self.critic_network = CriticNetwork(
             state_dim=self.state_dim,
@@ -128,6 +162,7 @@ class D2PPOAgent:
 
         # --- Replay Storage ---
         self.buffer = TensorDictReplayBuffer(storage=ListStorage(max_size=steps))
+        self._last_obs_features = None  # Cached by get_action_and_value for store_transition
 
         # --- Diagnostics ---
         self.plot_save_path = "plots/d2ppo_training_diagnostics.png"
@@ -136,8 +171,8 @@ class D2PPOAgent:
             os.makedirs(plot_dir)
 
         self.diagnostic_keys = [
-            "loss_actor", "loss_critic",
-            "kl_approx", "clip_fraction", "collisions", "reward",
+            "loss_actor", "loss_critic", "loss_diffusion",
+            "loss_dispersive", "adv_weight_mean", "collisions", "reward",
         ]
         self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
         self.generation_counter = 0
@@ -155,102 +190,6 @@ class D2PPOAgent:
     def update_buffer_size(self, new_size):
         self.buffer = TensorDictReplayBuffer(storage=ListStorage(max_size=new_size))
         print(f"Updated replay buffer size to {new_size}")
-
-    def _transfer_weights(self, path, network):
-        if path is None:
-            return network.to(self.device)
-        if not os.path.exists(path):
-            print(f"Warning: checkpoint '{path}' not found — using random init.")
-            return network.to(self.device)
-
-        checkpoint = torch.load(path, weights_only=False)
-
-        # Accept both raw state_dict (OrderedDict) and wrapped formats
-        if isinstance(checkpoint, dict):
-            state_dict_raw = checkpoint
-        elif isinstance(checkpoint, list):
-            print(f"Warning: '{path}' is a list (demos?), not a state_dict — skipping.")
-            return network.to(self.device)
-        else:
-            print(f"Warning: '{path}' has unexpected type {type(checkpoint).__name__} — skipping.")
-            return network.to(self.device)
-
-        prefix = "0.module."
-        state_dict = {}
-        for k, v in state_dict_raw.items():
-            if not isinstance(v, torch.Tensor):
-                continue
-            if k.startswith(prefix):
-                state_dict[k[len(prefix):]] = v
-            else:
-                state_dict[k] = v
-        if state_dict:
-            net_sd = network.state_dict()
-            filtered = {
-                k: v for k, v in state_dict.items()
-                if k in net_sd and net_sd[k].shape == v.shape
-            }
-            if filtered:
-                network.load_state_dict(filtered, strict=False)
-                print(f"Loaded {len(filtered)}/{len(net_sd)} compatible weight tensors from '{path}'.")
-            else:
-                print(f"No compatible weights found in '{path}'.")
-        return network.to(self.device)
-
-    def _transfer_vision(self, path):
-        new_encoder = VisionEncoder(self.num_scan_beams)
-        if path is None:
-            return new_encoder.to(self.device)
-        checkpoint = torch.load(path, weights_only=False)
-        prefix = "conv_layers."
-        encoder_sd = {}
-        for k, v in checkpoint.items():
-            if k.startswith(prefix):
-                encoder_sd[k[len(prefix):]] = v
-            elif k.startswith("0.module." + prefix):
-                encoder_sd[k[len("0.module." + prefix):]] = v
-        if encoder_sd:
-            new_encoder.load_state_dict(encoder_sd)
-            print("Loaded pre-trained vision encoder weights.")
-        return new_encoder.to(self.device)
-
-    def _load_waypoints(self, map_name):
-        waypoint_file = f"maps/{map_name}/{map_name}_raceline.csv"
-        waypoints = np.loadtxt(waypoint_file, delimiter=";")
-        waypoints_xy = waypoints[:, 1:3]
-        positions = waypoints[:, 1:3]
-        distances = np.sqrt(np.sum(np.diff(positions, axis=0) ** 2, axis=1))
-        waypoints_s = np.insert(np.cumsum(distances), 0, 0)
-        raceline_length = waypoints_s[-1]
-        return waypoints_xy, waypoints_s, raceline_length
-
-    def _obs_to_tensors(self, obs):
-        # Robustly handle several possible shapes returned by the environment:
-        # - (num_agents, scan_len)
-        # - (num_timesteps, num_agents, scan_len) (pick last timestep)
-        scans_arr = np.array(obs["scans"])
-        if scans_arr.ndim >= 3 and scans_arr.shape[0] != self.num_agents and scans_arr.shape[1] == self.num_agents:
-            # e.g., (T, N, scan_len) -> take last timestep
-            scans_arr = scans_arr[-1]
-        scans_arr = scans_arr[: self.num_agents]
-        scan_tensors = torch.from_numpy(scans_arr.astype(np.float32)).unsqueeze(1)
-
-        # State fields may also be time-major (T, N). Handle similarly.
-        def last_or_first(arr):
-            a = np.array(arr)
-            if a.ndim > 1 and a.shape[0] != self.num_agents and a.shape[1] == self.num_agents:
-                return a[-1]
-            return a
-
-        lvx = last_or_first(obs["linear_vels_x"])[: self.num_agents]
-        lvy = last_or_first(obs["linear_vels_y"])[: self.num_agents]
-        avz = last_or_first(obs["ang_vels_z"])[: self.num_agents]
-        lax = last_or_first(obs["linear_accel_x"])[: self.num_agents]
-
-        state_data = np.stack((lvx, lvy, avz, lax), axis=1)
-        state_tensor = torch.from_numpy(state_data.astype(np.float32))
-
-        return scan_tensors.to(self.device), state_tensor.to(self.device)
 
     def reset_buffers(self, agent_indices=None):
         """Reset LSTM hidden states and observation buffers."""
@@ -320,6 +259,11 @@ class D2PPOAgent:
             self.actor_buffer.append(new_buffer)
             self.actor_hidden = (new_h, new_c)
 
+            # Cache obs_features for store_transition (avoids re-encoding
+            # with zero hidden states during learn(), eliminating the
+            # train-test temporal mismatch).
+            self._last_obs_features = obs_features.float()
+
         return action, log_prob, value
 
 
@@ -336,6 +280,7 @@ class D2PPOAgent:
             {
                 "observation_scan": obs[0],
                 "observation_state": obs[1],
+                "obs_features": self._last_obs_features,
                 "action": action,
                 "action_log_prob": log_prob,
                 "state_value": value,
@@ -350,6 +295,321 @@ class D2PPOAgent:
             batch_size=[self.num_agents],
         )
         self.buffer.add(step_data.to(self.device))
+
+    def calculate_reward(self, next_obs):
+        collisions = np.array(next_obs["collisions"][:self.num_agents])
+        speeds = np.array(next_obs["linear_vels_x"][:self.num_agents])
+        wall_collisions = collisions == 1
+        agent_collisions = collisions == 2
+        rewards = np.zeros(self.num_agents)
+
+        target_speed = self.gfpp.get_actions_batch(next_obs)
+        speed_bonus = (speeds - target_speed[:self.num_agents, 1]) * self.SPEED_REWARD
+        rewards += speed_bonus
+        rewards += wall_collisions * self.COLLISION_PENALTY
+        rewards += agent_collisions * (self.AGENT_COLLISION_PENALTY * 0.5)
+
+        rewards_tensor = torch.from_numpy(rewards.astype(np.float32)).unsqueeze(-1)
+        avg_reward = rewards.mean()
+        return rewards_tensor, avg_reward
+
+    def reset_progress_trackers(self, initial_poses_xy, agent_idxs=None):
+        if agent_idxs is not None:
+            agent_idxs = agent_idxs[agent_idxs < self.num_agents]
+            for i in agent_idxs:
+                current_pos = initial_poses_xy[i]
+                distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
+                closest = np.argmin(distances)
+                self.last_cumulative_distance[i] = self.waypoints_s[closest]
+                self.last_wp_index[i] = closest
+                self.start_s[i] = self.waypoints_s[closest]
+                self.current_lap_count[i] = 0
+                self.last_checkpoint[i] = 0
+            return
+
+        for i in range(self.num_agents):
+            current_pos = initial_poses_xy[i]
+            distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
+            closest = np.argmin(distances)
+            self.last_cumulative_distance[i] = self.waypoints_s[closest]
+            self.last_wp_index[i] = closest
+            self.start_s[i] = self.waypoints_s[closest]
+            self.current_lap_count[i] = 0
+            self.last_checkpoint[i] = 0
+
+    def learn(self, collisions, reward):
+        """Advantage-Weighted Diffusion Regression + Diffusion Regulariser.
+
+        Replaces the (broken) per-step importance-sampled PPO with a simpler,
+        more stable objective:
+
+            L_actor = E_t[ w(A) * ||ε_θ - ε||² ]  +  λ * E_t[ ||ε_θ - ε||² ]
+
+        where  w(A) = exp(A / β)  weights the noise-prediction MSE by the
+        normalised advantage, biasing the denoiser toward high-return actions.
+        The λ term keeps pure denoising ability from degrading.
+
+        The critic uses Huber loss with PPO-style value clipping.
+        """
+        print("Starting AWR-Diffusion learning...")
+        print(f"  Buffer size: {len(self.buffer)}")
+
+        data = self.buffer.sample(batch_size=len(self.buffer))
+
+        current_gen_diagnostics = {key: [] for key in self.diagnostic_keys}
+        current_gen_diagnostics["collisions"] = [collisions]
+        current_gen_diagnostics["reward"] = [reward]
+
+        # Compute GAE
+        with torch.no_grad():
+            data = self._compute_gae(data)
+
+        obs_scan_all = data["observation_scan"]
+        obs_state_all = data["observation_state"]
+        obs_features_all = data["obs_features"]  # Cached from rollout (with LSTM context)
+        actions_all = data["action"]
+        advantages_all = data["advantage"]
+        value_targets_all = data["value_target"]
+        old_values_all = data["state_value"]
+
+        num_timesteps = len(data)
+
+        self.actor_network.train()
+        self.critic_network.train()
+
+        # Flush stale intermediate features accumulated during rollout.
+        # The diffusion_utils ConditionalDenoisingMLP appends to a list on
+        # every forward pass (including the K denoising steps inside
+        # sample_action_with_chain).  Without this clear, the first
+        # minibatch would receive ~steps*K rollout features alongside its
+        # own, poisoning the dispersive loss.
+        self.actor_network.denoise_net.get_intermediate_features()  # returns & clears
+
+        K = self.num_diffusion_steps
+
+        print(f"  Training: {self.epochs} epochs, {num_timesteps} timesteps, "
+              f"AWR temp={self.awr_temperature}, diff_reg={self.diff_reg_lambda}")
+
+        for epoch in range(self.epochs):
+            epoch_actor_loss = 0.0
+            epoch_critic_loss = 0.0
+            epoch_diff_loss = 0.0
+            num_updates = 0
+
+            indices = torch.randperm(num_timesteps)
+
+            for mb_start in range(0, num_timesteps, self.minibatch_size):
+                mb_end = min(mb_start + self.minibatch_size, num_timesteps)
+                mb_idx = indices[mb_start:mb_end]
+
+                obs_scan = obs_scan_all[mb_idx]
+                obs_state = obs_state_all[mb_idx]
+                obs_features = obs_features_all[mb_idx]
+                actions = actions_all[mb_idx]
+                advantages = advantages_all[mb_idx]
+                value_targets = value_targets_all[mb_idx]
+                old_values = old_values_all[mb_idx]
+
+                # Flatten agents dimension if present: [T, A, ...] → [T*A, ...]
+                if obs_scan.ndim == 4:  # [T, A, 1, beams]
+                    T, A = obs_scan.shape[:2]
+                    obs_scan = obs_scan.reshape(T * A, *obs_scan.shape[2:])
+                    obs_state = obs_state.reshape(T * A, *obs_state.shape[2:])
+                    obs_features = obs_features.reshape(T * A, *obs_features.shape[2:])
+                    actions = actions.reshape(T * A, *actions.shape[2:])
+                    advantages = advantages.reshape(T * A)
+                    value_targets = value_targets.reshape(T * A)
+                    old_values = old_values.reshape(T * A)
+                elif obs_scan.ndim == 3 and advantages.ndim == 2:
+                    T, A = advantages.shape
+                    obs_scan = obs_scan.reshape(T * A, *obs_scan.shape[2:]) if obs_scan.shape[0] == T else obs_scan
+                    obs_state = obs_state.reshape(T * A, -1) if obs_state.shape[0] == T else obs_state
+                    obs_features = obs_features.reshape(T * A, -1)
+                    actions = actions.reshape(T * A, -1)
+                    advantages = advantages.reshape(T * A)
+                    value_targets = value_targets.reshape(T * A)
+                    old_values = old_values.reshape(T * A)
+
+                B = obs_scan.shape[0]
+
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.critic_optimizer.zero_grad(set_to_none=True)
+
+                # obs_features were cached during rollout with full LSTM
+                # temporal context — no need to re-encode.  Gradients flow
+                # through the denoiser only (encoder stays at BC-pretrained
+                # weights, avoiding the need for TBPTT).
+
+                # Actor: Advantage-Weighted Diffusion Regression
+                actions_norm = self.actor_network.normalize_action(actions)
+
+                # Random diffusion timestep per sample (standard DDPM training)
+                t = torch.randint(0, K, (B,), device=self.device)
+                noise = torch.randn_like(actions_norm)
+                noisy_actions = self.actor_network.q_sample(actions_norm, t, noise=noise)
+                pred_noise = self.actor_network.predict_noise(
+                    noisy_actions, obs_features, t
+                )
+
+                # Per-sample noise prediction MSE: (B,)
+                per_sample_mse = ((pred_noise - noise) ** 2).sum(dim=-1)
+
+                # Advantage weights: exp(A / β), normalised
+                adv = advantages.detach()
+                weights = torch.exp(adv / self.awr_temperature)
+                weights = weights.clamp(max=self.awr_max_weight)
+                weights = weights / (weights.mean() + 1e-8)
+
+                # Weighted diffusion loss (advantage-weighted regression)
+                awr_loss = (weights * per_sample_mse).mean()
+
+                # Unweighted diffusion loss (regulariser — maintains denoising ability)
+                diff_reg = per_sample_mse.mean()
+
+                # Dispersive loss on intermediate denoiser features
+                # The forward hook already captured features from predict_noise above
+                feat_dict = self.actor_network.denoise_net.get_intermediate_features()
+                if isinstance(feat_dict, list):
+                    feat_dict = {i: f for i, f in enumerate(feat_dict)}
+                disp_loss = torch.tensor(0.0, device=self.device)
+                n_feats = 0
+                for _, feats in feat_dict.items():
+                    if feats.ndim > 2:
+                        feats = feats.mean(dim=list(range(1, feats.ndim - 1)))
+                    dl = dispersive_loss_infonce_l2(
+                        feats, self.dispersive_temperature
+                    )
+                    if not torch.isnan(dl) and not torch.isinf(dl):
+                        disp_loss = disp_loss + dl
+                        n_feats += 1
+                if n_feats > 0:
+                    disp_loss = disp_loss / n_feats
+
+                actor_loss = (
+                    awr_loss
+                    + self.diff_reg_lambda * diff_reg
+                    + self.dispersive_lambda * disp_loss
+                )
+
+                # Critic: Huber loss with PPO-style value clipping
+                predicted_values = self.critic_network(obs_scan, obs_state)
+                if predicted_values.ndim > 1:
+                    predicted_values = predicted_values.squeeze(-1)
+
+                # PPO value clipping: prevent large value function updates
+                v_clipped = old_values + (predicted_values - old_values).clamp(
+                    -self.clip_epsilon, self.clip_epsilon
+                )
+                critic_loss_unclipped = F.smooth_l1_loss(
+                    predicted_values, value_targets.detach(), reduction='none'
+                )
+                critic_loss_clipped = F.smooth_l1_loss(
+                    v_clipped, value_targets.detach(), reduction='none'
+                )
+                critic_loss = torch.max(critic_loss_unclipped, critic_loss_clipped).mean()
+
+                # Backward & update
+                self.actor_scaler.scale(actor_loss).backward()
+                self.actor_scaler.unscale_(self.actor_optimizer)
+                nn.utils.clip_grad_norm_(
+                    self.actor_network.parameters(), self.max_grad_norm_actor
+                )
+                self.actor_scaler.step(self.actor_optimizer)
+                self.actor_scaler.update()
+
+                self.critic_scaler.scale(critic_loss).backward()
+                self.critic_scaler.unscale_(self.critic_optimizer)
+                nn.utils.clip_grad_norm_(
+                    self.critic_network.parameters(), self.max_grad_norm_critic
+                )
+                self.critic_scaler.step(self.critic_optimizer)
+                self.critic_scaler.update()
+
+                epoch_actor_loss += actor_loss.item()
+                epoch_critic_loss += critic_loss.item()
+                epoch_diff_loss += diff_reg.item()
+                num_updates += 1
+
+                current_gen_diagnostics["loss_actor"].append(actor_loss.item())
+                current_gen_diagnostics["loss_critic"].append(critic_loss.item())
+                current_gen_diagnostics["loss_diffusion"].append(diff_reg.item())
+                current_gen_diagnostics["loss_dispersive"].append(disp_loss.item())
+                current_gen_diagnostics["adv_weight_mean"].append(weights.mean().item())
+
+            if num_updates > 0:
+                print(
+                    f"  Epoch {epoch+1}/{self.epochs}: "
+                    f"Actor={epoch_actor_loss/num_updates:.4f}, "
+                    f"Critic={epoch_critic_loss/num_updates:.4f}, "
+                    f"Diff={epoch_diff_loss/num_updates:.4f}"
+                )
+
+            torch.cuda.empty_cache()
+
+        # --- Post-training bookkeeping ---
+        self.generation_counter += 1
+        for key in self.diagnostic_keys:
+            values = current_gen_diagnostics.get(key)
+            if values:
+                avg_val = np.mean(values)
+                min_val = np.min(values)
+                max_val = np.max(values)
+                self.diagnostics_history[key].append((avg_val, min_val, max_val))
+
+        if self.generation_counter > 0:
+            self._plot_historical_diagnostics()
+
+        self.buffer.empty()
+        del data
+        torch.cuda.empty_cache()
+        print("[D²PPO Stage 2] Learning complete.")
+
+    def _plot_historical_diagnostics(self):
+        keys_to_plot = [
+            k for k in self.diagnostic_keys
+            if k in self.diagnostics_history and self.diagnostics_history[k]
+        ]
+        num_metrics = len(keys_to_plot)
+        if num_metrics == 0 or self.generation_counter == 0:
+            return
+
+        plt.style.use("dark_background")
+        fig, axes = plt.subplots(num_metrics, 1, figsize=(25, 5 * num_metrics), sharex=True)
+        if num_metrics == 1:
+            axes = [axes]
+        plt.rcParams["font.size"] = 24
+        plt.rcParams["lines.linewidth"] = 3
+
+        x_axis = np.arange(1, self.generation_counter + 1)
+
+        for idx, key in enumerate(keys_to_plot):
+            values = self.diagnostics_history.get(key, [])
+            ax = axes[idx]
+            if not values:
+                ax.set_ylabel(key)
+                ax.grid(True)
+                continue
+            values_np = np.array(values)
+            if values_np.ndim == 1:
+                values_np = np.stack([values_np, values_np, values_np], axis=1)
+            for i, stat in enumerate(["Avg", "Min", "Max"]):
+                stat_values = values_np[:, i]
+                valid = ~np.isnan(stat_values)
+                if np.any(valid):
+                    ax.plot(x_axis[valid], stat_values[valid], marker=".", linestyle="-", label=f"{stat}")
+            ax.set_ylabel(key)
+            if ax.get_legend_handles_labels()[1]:  # Only add legend if there are labeled artists
+                ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+            ax.grid(True)
+
+        axes[-1].set_xlabel("Generation")
+        fig.suptitle("D²PPO Training Diagnostics", fontsize=16)
+        fig.tight_layout(rect=[0, 0.03, 1, 0.97])
+        try:
+            plt.savefig(self.plot_save_path)
+        except Exception as e:
+            print(f"Error saving plot: {e}")
+        plt.close(fig)
 
     def _compute_gae(self, data):
         rewards = data.get(("next", "reward")).to(self.device)
@@ -415,300 +675,96 @@ class D2PPOAgent:
         projected_s = s_prev + L * segment_distance
         
         return projected_s, closest_wp_index_global
+    
+    def _transfer_weights(self, path, network):
+        if path is None:
+            return network.to(self.device)
+        if not os.path.exists(path):
+            print(f"Warning: checkpoint '{path}' not found — using random init.")
+            return network.to(self.device)
 
-    def calculate_reward(self, next_obs):
-        collisions = np.array(next_obs["collisions"][: self.num_agents])
-        speeds = np.array(next_obs["linear_vels_x"][: self.num_agents])
-        wall_collisions = collisions == 1
-        agent_collisions = collisions == 2
-        rewards = np.zeros(self.num_agents)
+        checkpoint = torch.load(path, weights_only=False)
 
-        target_speed = 9.0
-        speed_bonus = np.clip(speeds - target_speed, 0, 3.0) * self.SPEED_REWARD
-        rewards += speed_bonus
-        rewards += wall_collisions * self.COLLISION_PENALTY
-        rewards += agent_collisions * (self.AGENT_COLLISION_PENALTY * 0.5)
+        # Accept both raw state_dict (OrderedDict) and wrapped formats
+        if isinstance(checkpoint, dict):
+            state_dict_raw = checkpoint
+        elif isinstance(checkpoint, list):
+            print(f"Warning: '{path}' is a list (demos?), not a state_dict — skipping.")
+            return network.to(self.device)
+        else:
+            print(f"Warning: '{path}' has unexpected type {type(checkpoint).__name__} — skipping.")
+            return network.to(self.device)
 
-        rewards_tensor = torch.from_numpy(rewards.astype(np.float32)).unsqueeze(-1)
-        avg_reward = rewards.mean()
-        return rewards_tensor, avg_reward
-
-    def reset_progress_trackers(self, initial_poses_xy, agent_idxs=None):
-        if agent_idxs is not None:
-            agent_idxs = agent_idxs[agent_idxs < self.num_agents]
-            for i in agent_idxs:
-                current_pos = initial_poses_xy[i]
-                distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
-                closest = np.argmin(distances)
-                self.last_cumulative_distance[i] = self.waypoints_s[closest]
-                self.last_wp_index[i] = closest
-                self.start_s[i] = self.waypoints_s[closest]
-                self.current_lap_count[i] = 0
-                self.last_checkpoint[i] = 0
-            return
-
-        for i in range(self.num_agents):
-            current_pos = initial_poses_xy[i]
-            distances = np.linalg.norm(self.waypoints_xy - current_pos, axis=1)
-            closest = np.argmin(distances)
-            self.last_cumulative_distance[i] = self.waypoints_s[closest]
-            self.last_wp_index[i] = closest
-            self.start_s[i] = self.waypoints_s[closest]
-            self.current_lap_count[i] = 0
-            self.last_checkpoint[i] = 0
-
-    def learn(self, collisions, reward):
-        print("Starting PPO learning...")
-        print(f"  Buffer size: {len(self.buffer)}")
-
-        data = self.buffer.sample(batch_size=len(self.buffer))
-
-        current_gen_diagnostics = {key: [] for key in self.diagnostic_keys}
-        current_gen_diagnostics["collisions"] = [collisions]
-        current_gen_diagnostics["reward"] = [reward]
-
-        # Compute GAE
-        with torch.no_grad():
-            data = self._compute_gae(data)
-
-        obs_scan_all = data["observation_scan"]
-        obs_state_all = data["observation_state"]
-        actions_all = data["action"]
-        old_log_probs_all = data["action_log_prob"]
-        advantages_all = data["advantage"]
-        value_targets_all = data["value_target"]
-
-        num_timesteps = len(data)
-
-        self.actor_network.train()
-        self.critic_network.train()
-
-        K = self.num_diffusion_steps
-        S_size = self.ppo_sample_steps
-
-        print(f"  Training: {self.epochs} epochs, {num_timesteps} timesteps, "
-              f"sampling {S_size}/{K} denoising steps per update")
-
-        for epoch in range(self.epochs):
-            epoch_actor_loss = 0.0
-            epoch_critic_loss = 0.0
-            epoch_diff_loss = 0.0
-            epoch_disp_loss = 0.0
-            num_updates = 0
-
-            # Shuffle timestep indices for minibatch training
-            indices = torch.randperm(num_timesteps)
-
-            for mb_start in range(0, num_timesteps, self.minibatch_size):
-                mb_end = min(mb_start + self.minibatch_size, num_timesteps)
-                mb_idx = indices[mb_start:mb_end]
-
-                obs_scan = obs_scan_all[mb_idx]
-                obs_state = obs_state_all[mb_idx]
-                actions = actions_all[mb_idx]
-                old_lp = old_log_probs_all[mb_idx]
-                advantages = advantages_all[mb_idx]
-                value_targets = value_targets_all[mb_idx]
-
-                # Flatten agents dimension if present: [T, A, ...] → [T*A, ...]
-                if obs_scan.ndim == 4:  # [T, A, 1, beams]
-                    T, A = obs_scan.shape[:2]
-                    obs_scan = obs_scan.reshape(T * A, *obs_scan.shape[2:])
-                    obs_state = obs_state.reshape(T * A, *obs_state.shape[2:])
-                    actions = actions.reshape(T * A, *actions.shape[2:])
-                    old_lp = old_lp.reshape(T * A)
-                    advantages = advantages.reshape(T * A)
-                    value_targets = value_targets.reshape(T * A)
-                elif obs_scan.ndim == 3 and old_lp.ndim == 2:
-                    # [T, A, beams] but scan has channel dim
-                    T, A = old_lp.shape
-                    obs_scan = obs_scan.reshape(T * A, *obs_scan.shape[2:]) if obs_scan.shape[0] == T else obs_scan
-                    obs_state = obs_state.reshape(T * A, -1) if obs_state.shape[0] == T else obs_state
-                    actions = actions.reshape(T * A, -1)
-                    old_lp = old_lp.reshape(T * A)
-                    advantages = advantages.reshape(T * A)
-                    value_targets = value_targets.reshape(T * A)
-
-                B = obs_scan.shape[0]
-
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-
-                # --- Encode observations (no temporal continuity in shuffled minibatches) ---
-                obs_features, _, _, _ = self.actor_network.encode_observation(
-                    obs_scan, obs_state, obs_buffer=None,
-                    hidden_h=None, hidden_c=None,
-                )
-
-                # --- Critic value prediction ---
-                predicted_values = self.critic_network(obs_scan, obs_state)
-                if predicted_values.ndim > 1:
-                    predicted_values = predicted_values.squeeze(-1)
-                critic_loss = F.mse_loss(predicted_values, value_targets.detach())
-
-                # --- Actor: importance-sampled denoising-step PPO ---
-                # Sample a subset S of denoising timesteps (Eq. 14)
-                # Valid denoising transitions are t=1→0, t=2→1, ..., t=K-1→K-2
-                # so t ∈ {1, ..., K-1} (schedule indices are 0-based, 0 to K-1)
-                sampled_k = torch.randint(1, K, (S_size,), device=self.device)
-                # Uniform sampling probability: p(k) = 1/(K-1)
-                importance_weight = (K - 1) / S_size
-
-                total_policy_loss = torch.tensor(0.0, device=self.device)
-
-                # Normalise stored raw actions into [-1,1] for diffusion
-                actions_norm = self.actor_network.normalize_action(actions)
-
-                for k_val in sampled_k:
-                    k = k_val.item()
-                    t = torch.full((B,), k, device=self.device, dtype=torch.long)
-                    t_prev = t - 1  # k-1
-
-                    # Forward diffusion to get a^k from clean action a^0
-                    noise = torch.randn_like(actions_norm)
-                    a_k = self.actor_network.q_sample(actions_norm, t, noise=noise)
-
-                    # Use DDPM posterior to get a^{k-1} (the "observed" previous step)
-                    # a^{k-1} = q(a^{k-1}|a^0, a^k) — this is the target of the denoising step
-                    if k > 1:
-                        a_k_minus_1 = self.actor_network.q_sample(actions_norm, t_prev, noise=noise)
-                    else:
-                        a_k_minus_1 = actions_norm  # a^0
-
-                    # Current policy log-prob: log p_θ(a^{k-1}|a^k, s)
-                    new_log_prob_k = self.actor_network.compute_denoising_log_prob(
-                        a_k_minus_1, a_k, obs_features, t
-                    )
-
-                    # Old policy log-prob (from stored old_lp, uniformly distributed)
-                    # Each stored log_prob covers the full chain; divide by K for per-step
-                    old_log_prob_k = old_lp / K
-
-                    # Probability ratio r_t^(k) (Eq. 35-36)
-                    log_ratio = new_log_prob_k - old_log_prob_k
-                    log_ratio = torch.clamp(log_ratio, -5.0, 5.0)  # Stability
-                    ratio = torch.exp(log_ratio)
-
-                    # PPO clipped surrogate (Eq. 34)
-                    surr1 = ratio * advantages
-                    surr2 = torch.clamp(
-                        ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon
-                    ) * advantages
-                    step_loss = -torch.min(surr1, surr2).mean()
-
-                    total_policy_loss = total_policy_loss + importance_weight * step_loss
-
-                # Average over sampled steps
-                policy_loss = total_policy_loss / S_size
-
-                # Diffusion policies control exploration implicitly through
-                # stochastic denoising — no explicit entropy bonus needed.
-                actor_loss = policy_loss
-
-                # --- Backward & update ---
-                self.actor_scaler.scale(actor_loss).backward()
-                self.actor_scaler.unscale_(self.actor_optimizer)
-                nn.utils.clip_grad_norm_(
-                    self.actor_network.parameters(), self.max_grad_norm_actor
-                )
-                self.actor_scaler.step(self.actor_optimizer)
-                self.actor_scaler.update()
-
-                self.critic_scaler.scale(critic_loss).backward()
-                self.critic_scaler.unscale_(self.critic_optimizer)
-                nn.utils.clip_grad_norm_(
-                    self.critic_network.parameters(), self.max_grad_norm_critic
-                )
-                self.critic_scaler.step(self.critic_optimizer)
-                self.critic_scaler.update()
-
-                epoch_actor_loss += actor_loss.item()
-                epoch_critic_loss += critic_loss.item()
-                num_updates += 1
-
-                # Diagnostics
-                with torch.no_grad():
-                    kl_approx = (
-                        (torch.exp(log_ratio) - 1) - log_ratio
-                    ).mean().item()
-                    clip_frac = (
-                        (torch.abs(ratio - 1.0) > self.clip_epsilon).float().mean().item()
-                    )
-
-                current_gen_diagnostics["loss_actor"].append(actor_loss.item())
-                current_gen_diagnostics["loss_critic"].append(critic_loss.item())
-                current_gen_diagnostics["kl_approx"].append(kl_approx)
-                current_gen_diagnostics["clip_fraction"].append(clip_frac)
-
-            if num_updates > 0:
-                print(
-                    f"  Epoch {epoch+1}/{self.epochs}: "
-                    f"Actor={epoch_actor_loss/num_updates:.4f}, "
-                    f"Critic={epoch_critic_loss/num_updates:.4f}"
-                )
-
-            torch.cuda.empty_cache()
-
-        # --- Post-training bookkeeping ---
-        self.generation_counter += 1
-        for key in self.diagnostic_keys:
-            values = current_gen_diagnostics.get(key)
-            if values:
-                avg_val = np.mean(values)
-                min_val = np.min(values)
-                max_val = np.max(values)
-                self.diagnostics_history[key].append((avg_val, min_val, max_val))
-
-        if self.generation_counter > 0:
-            self._plot_historical_diagnostics()
-
-        self.buffer.empty()
-        del data
-        torch.cuda.empty_cache()
-        print("[D²PPO Stage 2] Learning complete.")
-
-    def _plot_historical_diagnostics(self):
-        keys_to_plot = [
-            k for k in self.diagnostic_keys
-            if k in self.diagnostics_history and self.diagnostics_history[k]
-        ]
-        num_metrics = len(keys_to_plot)
-        if num_metrics == 0 or self.generation_counter == 0:
-            return
-
-        plt.style.use("dark_background")
-        fig, axes = plt.subplots(num_metrics, 1, figsize=(25, 5 * num_metrics), sharex=True)
-        if num_metrics == 1:
-            axes = [axes]
-        plt.rcParams["font.size"] = 24
-        plt.rcParams["lines.linewidth"] = 3
-
-        x_axis = np.arange(1, self.generation_counter + 1)
-
-        for idx, key in enumerate(keys_to_plot):
-            values = self.diagnostics_history.get(key, [])
-            ax = axes[idx]
-            if not values:
-                ax.set_ylabel(key)
-                ax.grid(True)
+        prefix = "0.module."
+        state_dict = {}
+        for k, v in state_dict_raw.items():
+            if not isinstance(v, torch.Tensor):
                 continue
-            values_np = np.array(values)
-            if values_np.ndim == 1:
-                values_np = np.stack([values_np, values_np, values_np], axis=1)
-            for i, stat in enumerate(["Avg", "Min", "Max"]):
-                stat_values = values_np[:, i]
-                valid = ~np.isnan(stat_values)
-                if np.any(valid):
-                    ax.plot(x_axis[valid], stat_values[valid], marker=".", linestyle="-", label=f"{stat}")
-            ax.set_ylabel(key)
-            ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
-            ax.grid(True)
+            if k.startswith(prefix):
+                state_dict[k[len(prefix):]] = v
+            else:
+                state_dict[k] = v
+        if state_dict:
+            net_sd = network.state_dict()
+            filtered = {
+                k: v for k, v in state_dict.items()
+                if k in net_sd and net_sd[k].shape == v.shape
+            }
+            if filtered:
+                network.load_state_dict(filtered, strict=False)
+                print(f"Loaded {len(filtered)}/{len(net_sd)} compatible weight tensors from '{path}'.")
+            else:
+                print(f"No compatible weights found in '{path}'.")
+        return network.to(self.device)
 
-        axes[-1].set_xlabel("Generation")
-        fig.suptitle("D²PPO Training Diagnostics", fontsize=16)
-        fig.tight_layout(rect=[0, 0.03, 1, 0.97])
-        try:
-            plt.savefig(self.plot_save_path)
-        except Exception as e:
-            print(f"Error saving plot: {e}")
-        plt.close(fig)
+    def _transfer_vision(self, path):
+        new_encoder = VisionEncoder(self.num_scan_beams)
+        if path is None:
+            return new_encoder.to(self.device)
+        checkpoint = torch.load(path, weights_only=False)
+        prefix = "conv_layers."
+        encoder_sd = {}
+        for k, v in checkpoint.items():
+            if k.startswith(prefix):
+                encoder_sd[k[len(prefix):]] = v
+            elif k.startswith("0.module." + prefix):
+                encoder_sd[k[len("0.module." + prefix):]] = v
+        if encoder_sd:
+            new_encoder.load_state_dict(encoder_sd)
+            print("Loaded pre-trained vision encoder weights.")
+        return new_encoder.to(self.device)
+
+    def _load_waypoints(self, map_name):
+        waypoint_file = f"maps/{map_name}/{map_name}_raceline.csv"
+        waypoints = np.loadtxt(waypoint_file, delimiter=";")
+        waypoints_xy = waypoints[:, 1:3]
+        positions = waypoints[:, 1:3]
+        distances = np.sqrt(np.sum(np.diff(positions, axis=0) ** 2, axis=1))
+        waypoints_s = np.insert(np.cumsum(distances), 0, 0)
+        raceline_length = waypoints_s[-1]
+        
+        self.gfpp.update_map(map_name)
+        
+        return waypoints_xy, waypoints_s, raceline_length
+
+    def _obs_to_tensors(self, obs):
+        scans_arr = np.array(obs["scans"])
+        scans_arr = scans_arr[: self.num_agents]
+        scan_tensors = torch.from_numpy(scans_arr.astype(np.float32)).unsqueeze(1)
+
+        # State fields may also be time-major (T, N). Handle similarly.
+        def last_or_first(arr):
+            a = np.array(arr)
+            if a.ndim > 1 and a.shape[0] != self.num_agents and a.shape[1] == self.num_agents:
+                return a[-1]
+            return a
+
+        lvx = last_or_first(obs["linear_vels_x"])[: self.num_agents]
+        lvy = last_or_first(obs["linear_vels_y"])[: self.num_agents]
+        avz = last_or_first(obs["ang_vels_z"])[: self.num_agents]
+        lax = last_or_first(obs["linear_accel_x"])[: self.num_agents]
+
+        state_data = np.stack((lvx, lvy, avz, lax), axis=1)
+        state_tensor = torch.from_numpy(state_data.astype(np.float32))
+
+        return scan_tensors.to(self.device), state_tensor.to(self.device)

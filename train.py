@@ -63,7 +63,7 @@ env = gym.make(
 # --- Agent Setup ---
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 
-ORIGINAL_WEIGHT = "models/actor/pretrained/actor_final.pt"
+ORIGINAL_WEIGHT = "models/actor/pretrained/actor_pretrained.pt"
 ACTOR_CHECKPOINT = f"models/actor/best/actor_gen_93.pt"
 CRITIC_CHECKPOINT = f"models/critic/best/critic_gen_93.pt"
 
@@ -120,7 +120,7 @@ for gen in range(num_generations):
         timer = time.time()
         done_np = np.zeros(NUM_AGENTS, dtype=np.int32)
         
-        env.render(mode="human")
+        # env.render(mode="human")
         
         # Get Action from Agent
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)
@@ -199,6 +199,7 @@ Collisions: {collisions}, \
 Max vel: {np.max(next_obs['linear_vels_x'][:NUM_AGENTS_AI]):.1f} m/s, \
 Max actor_vel: {torch.max(action_tensor[:,1]).item():.1f} m/s, \
 Ego Speed: {next_obs['linear_vels_x'][0]:.2f} \
+Max Accel: {np.max(np.abs(next_obs['linear_accel_x'][:NUM_AGENTS_AI])):.2f} m/s², \
 Avg Reward: {sum(total_reward_this_gen) / (step + 1):.3f} \
 S/s: {1 / (time.time() - timer):.1f}", end='\r')
         
@@ -208,7 +209,6 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
     current_physics_time = 0.0
     
     # --- END OF GENERATION ---
-    print(len(total_reward_this_gen), STEPS_PER_GENERATION, agent.raceline_length)
     reward_avg = sum(total_reward_this_gen) / len(total_reward_this_gen)
     current_avg_ego_reward = sum(ego_reward_this_gen) / len(total_reward_this_gen)
 

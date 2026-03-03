@@ -5,7 +5,7 @@ Mirrors the architecture of HybridLSTM / ExampleNetwork but replaces the
 Gaussian action distribution with DDPM-based iterative denoising.
 
 Observation pipeline:
-    VisionEncoder(CNN) → state normalisation → feature_projection → LSTM
+    VisionEncoder(CNN) → state normalization → feature_projection → LSTM
     → obs_features (temporal context)
 
 Action generation:
@@ -25,7 +25,7 @@ class DiffusionLSTM(nn.Module):
 
     Observation encoder follows the same pattern as ``ExampleNetwork`` /
     ``HybridLSTM``:
-        VisionEncoder → state normalise → feature_projection → LSTM
+        VisionEncoder → state normalization → feature_projection → LSTM
         → obs_features (temporal context)
 
     ``create_observation_buffer`` + ``get_init_hidden`` match the LSTM model

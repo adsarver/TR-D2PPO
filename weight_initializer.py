@@ -41,6 +41,8 @@ def dispersive_loss_infonce_l2(features, temperature=0.5):
     B = features.shape[0]
     if B < 2:
         return torch.tensor(0.0, device=features.device)
+    # Project to unit sphere (standard in contrastive learning)
+    features = F.normalize(features, dim=-1)
     diff = features.unsqueeze(0) - features.unsqueeze(1)
     sq_dist = (diff ** 2).sum(dim=-1)
     mask = ~torch.eye(B, dtype=torch.bool, device=features.device)
