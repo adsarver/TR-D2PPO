@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.AuxModels import VisionEncoder
 
 class CriticNetwork(nn.Module):
     """
@@ -14,12 +15,13 @@ class CriticNetwork(nn.Module):
         encoder=None,
         d_model=256,
         memory_length=48,    # Sequence length
-        odom_expand=64
+        odom_expand=64,
+        num_scan_beams=1080
         ):
         super(CriticNetwork, self).__init__()
         
         # Vision encoder (CNN for LIDAR)
-        self.conv_layers = encoder
+        self.conv_layers = encoder if encoder is not None else VisionEncoder(num_scan_beams=num_scan_beams)
         conv_output_size = self.conv_layers.output_size
         
         # Memory configuration

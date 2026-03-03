@@ -6,6 +6,8 @@ from D2PPO_agent import D2PPOAgent as PPOAgent
 from baselines.pure_pursuit import PurePursuit
 from utils.utils import *
 import torch
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision('high')
 import random
 
 params_dict = {'mu': 1.0489,
@@ -61,7 +63,7 @@ env = gym.make(
 # --- Agent Setup ---
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 
-ORIGINAL_WEIGHT = None
+ORIGINAL_WEIGHT = "models/actor/pretrained/actor_final.pt"
 ACTOR_CHECKPOINT = f"models/actor/best/actor_gen_93.pt"
 CRITIC_CHECKPOINT = f"models/critic/best/critic_gen_93.pt"
 
@@ -80,6 +82,10 @@ pp_driver = PurePursuit(
     max_speed=5.0,
     min_speed=1.5
 )
+
+if hasattr(torch, 'compile'):
+    agent.actor_network = torch.compile(agent.actor_network)
+    agent.critic_network = torch.compile(agent.critic_network)
 
 STEPS_PER_GENERATION = int((agent.raceline_length / 7) * 100)
 agent.update_buffer_size(STEPS_PER_GENERATION)
@@ -114,7 +120,7 @@ for gen in range(num_generations):
         timer = time.time()
         done_np = np.zeros(NUM_AGENTS, dtype=np.int32)
         
-        # env.render(mode="human")
+        env.render(mode="human")
         
         # Get Action from Agent
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)

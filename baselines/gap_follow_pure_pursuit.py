@@ -1,6 +1,6 @@
 import numpy as np
-from pure_pursuit import PurePursuit
-from gap_follow import GapFollow
+from baselines.pure_pursuit import PurePursuit
+from baselines.gap_follow import GapFollow
 
 
 class GapFollowPurePursuit:

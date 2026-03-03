@@ -55,6 +55,9 @@ class DiffusionLSTM(nn.Module):
         memory_length=5,
         memory_stride=5,
         odom_expand=64,
+        # Action normalisation range  (raw env units → [-1, 1])
+        action_low=(-0.34, 0.0),     # (min_steering, min_speed)
+        action_high=(0.34, 10.0),     # (max_steering, max_speed)
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -83,6 +86,15 @@ class DiffusionLSTM(nn.Module):
         state_hi = torch.tensor([r[1] for r in default_ranges[:state_dim]], dtype=torch.float32)
         self.register_buffer("state_lo", state_lo)
         self.register_buffer("state_hi", state_hi)
+
+        # --- Action normalisation  (raw ↔ [-1, 1]) ---
+        # DDPM assumes x_0 lives in a standard-ish range.  We map
+        # [action_low, action_high] ↔ [-1, 1] before any diffusion op
+        # and invert after sampling.
+        act_lo = torch.tensor(action_low,  dtype=torch.float32)
+        act_hi = torch.tensor(action_high, dtype=torch.float32)
+        self.register_buffer("action_lo", act_lo)
+        self.register_buffer("action_hi", act_hi)
 
         # --- State expansion ---
         self.odom_expand_layer = nn.Linear(state_dim, odom_expand)
@@ -189,7 +201,7 @@ class DiffusionLSTM(nn.Module):
         """
         batch_size = scan_tensor.shape[0]
         device = scan_tensor.device
-
+        
         if obs_buffer is None:
             obs_buffer = self.create_observation_buffer(batch_size, device)
         if hidden_h is None or hidden_c is None:
@@ -199,7 +211,7 @@ class DiffusionLSTM(nn.Module):
                       hidden_c.transpose(0, 1).contiguous())
 
         # Scan normalisation
-        scan_norm = scan_tensor.clamp(0.0, 30.0) / 30.0
+        scan_norm = scan_tensor.clamp(0.0, 10.0) / 10.0
 
         # CNN features
         vision_features = self.vision_encoder(scan_norm)
@@ -233,6 +245,14 @@ class DiffusionLSTM(nn.Module):
 
         return obs_features, obs_buffer, hidden_h_out, hidden_c_out
 
+    def normalize_action(self, action):
+        """Map raw action from [action_lo, action_hi] → [-1, 1]."""
+        return 2.0 * (action - self.action_lo) / (self.action_hi - self.action_lo + 1e-8) - 1.0
+
+    def denormalize_action(self, action_norm):
+        """Map normalised action from [-1, 1] → [action_lo, action_hi]."""
+        return (action_norm + 1.0) * 0.5 * (self.action_hi - self.action_lo) + self.action_lo
+
     # ------------------------------------------------------------------
     # Forward / reverse diffusion helpers
     # ------------------------------------------------------------------
@@ -249,10 +269,20 @@ class DiffusionLSTM(nn.Module):
     @torch.no_grad()
     def p_mean_variance(self, x_t, obs_features, t):
         pred_noise = self.predict_noise(x_t, obs_features, t)
-        sqrt_recip = extract(self.sqrt_recip_alphas, t, x_t.shape)
-        beta_t = extract(self.betas, t, x_t.shape)
-        sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
-        mean = sqrt_recip * (x_t - beta_t / sqrt_one_minus * pred_noise)
+
+        # Predict x_0 from the noise prediction and clamp to [-1, 1]
+        # This prevents cascading amplification of prediction errors through
+        # the reverse chain (critical with aggressive cosine schedule / few steps).
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+        x_0_pred = (x_t - sqrt_one_minus_t * pred_noise) / sqrt_alphas_cumprod_t.clamp(min=1e-8)
+        x_0_pred = x_0_pred.clamp(-1.0, 1.0)
+
+        # Re-derive posterior mean from the clamped x_0 prediction
+        coef1 = extract(self.posterior_mean_coef1, t, x_t.shape)
+        coef2 = extract(self.posterior_mean_coef2, t, x_t.shape)
+        mean = coef1 * x_0_pred + coef2 * x_t
+
         var = extract(self.posterior_variance, t, x_t.shape)
         log_var = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return mean, var, log_var
@@ -276,7 +306,7 @@ class DiffusionLSTM(nn.Module):
                 x = mean
             else:
                 x = self.p_sample(x, obs_features, t)
-        return x
+        return self.denormalize_action(x.clamp(-1.0, 1.0))   # [-1,1] → raw action space
 
     # ------------------------------------------------------------------
     # Losses
@@ -285,18 +315,27 @@ class DiffusionLSTM(nn.Module):
     def compute_diffusion_loss(self, actions, obs_features):
         B = actions.shape[0]
         device = actions.device
+        actions_norm = self.normalize_action(actions)   # raw → [-1,1]
         t = torch.randint(0, self.num_diffusion_steps, (B,), device=device)
-        noise = torch.randn_like(actions)
-        noisy = self.q_sample(actions, t, noise=noise)
+        noise = torch.randn_like(actions_norm)
+        noisy = self.q_sample(actions_norm, t, noise=noise)
         pred = self.predict_noise(noisy, obs_features, t)
         return F.mse_loss(pred, noise)
 
     def compute_denoising_log_prob(self, a_prev, a_curr, obs_features, t):
         pred_noise = self.predict_noise(a_curr, obs_features, t)
-        sqrt_recip = extract(self.sqrt_recip_alphas, t, a_curr.shape)
-        beta_t = extract(self.betas, t, a_curr.shape)
-        sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t, a_curr.shape)
-        mean = sqrt_recip * (a_curr - beta_t / sqrt_one_minus * pred_noise)
+
+        # Predict x_0 from noise prediction and clamp (matches p_mean_variance)
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, a_curr.shape)
+        sqrt_one_minus_t = extract(self.sqrt_one_minus_alphas_cumprod, t, a_curr.shape)
+        x_0_pred = (a_curr - sqrt_one_minus_t * pred_noise) / sqrt_alphas_cumprod_t.clamp(min=1e-8)
+        x_0_pred = x_0_pred.clamp(-1.0, 1.0)
+
+        # Re-derive posterior mean from clamped x_0
+        coef1 = extract(self.posterior_mean_coef1, t, a_curr.shape)
+        coef2 = extract(self.posterior_mean_coef2, t, a_curr.shape)
+        mean = coef1 * x_0_pred + coef2 * a_curr
+
         var = extract(self.posterior_variance, t, a_curr.shape).clamp(min=1e-6)
         log_prob = -0.5 * ((a_prev - mean) ** 2 / var + torch.log(var)
                            + math.log(2 * math.pi))
@@ -307,8 +346,9 @@ class DiffusionLSTM(nn.Module):
         device = obs_features.device
         total = torch.zeros(B, device=device)
         K = len(denoising_chain) - 1
+        
         for step_idx in range(K):
-            k = K - step_idx
+            k = K - 1 - step_idx
             t = torch.full((B,), k, device=device, dtype=torch.long)
             total += self.compute_denoising_log_prob(
                 denoising_chain[step_idx + 1],
@@ -334,7 +374,9 @@ class DiffusionLSTM(nn.Module):
                 x = self.p_sample(x, obs_features, t)
             chain.append(x.clone())
         log_prob = self.compute_chain_log_prob(chain, obs_features)
-        return chain[-1], chain, log_prob
+        
+        # chain lives in normalised [-1,1] space; clamp and return raw action
+        return self.denormalize_action(chain[-1].clamp(-1.0, 1.0)), chain, log_prob
 
     # ------------------------------------------------------------------
     # Convenience forward (matches ExampleNetwork / HybridLSTM signature)

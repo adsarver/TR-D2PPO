@@ -5,3 +5,4 @@ models/critic/*
 */map_results/
 *.pkl
 *.whl
+demos/*

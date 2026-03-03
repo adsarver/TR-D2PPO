@@ -1,21 +1,15 @@
 """
-D2PPO: Diffusion Policy Policy Optimization with Dispersive Loss
-================================================================
-Implementation based on: "D²PPO: Diffusion Policy Policy Optimization with 
+D2PPO: Diffusion Policy Policy Optimization — Pure RL
+=====================================================
+Implementation based on: "D²PPO: Diffusion Policy Policy Optimization with
 Dispersive Loss" (Zou et al., 2025) - arXiv:2508.02644
 
-Two-stage training paradigm:
-  Stage 1: Pre-training with diffusion loss + dispersive loss regularization
-  Stage 2: PPO fine-tuning with importance-sampled denoising steps
-
 The diffusion policy models the action distribution as an iterative denoising
-process (DDPM). Dispersive loss combats representation collapse by treating all
-hidden representations within each batch as negative pairs, encouraging the
-network to learn discriminative representations of similar observations.
+process (DDPM).  This agent uses **only** the PPO (Stage 2) objective — no
+supervised / BC pre-training or dispersive loss.
 """
 
 from collections import deque
-import math
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -30,106 +24,14 @@ from models.CriticNetworks import CriticNetwork
 from models.DiffusionLSTM import DiffusionLSTM
 from utils.utils import to_birds_eye
 
-def dispersive_loss_infonce_l2(features, temperature=0.5):
-    """
-    InfoNCE-based Dispersive Loss with L2 Distance (Eq. 8 / 19).
-    
-    L_disp^{L2} = log( 1/(B(B-1)) Σ_i Σ_{j≠i} exp(-||h_i - h_j||^2 / τ) )
-    
-    Encourages all representations in a batch to be maximally dispersed
-    using squared Euclidean distance.
-    """
-    B = features.shape[0]
-    if B < 2:
-        return torch.tensor(0.0, device=features.device)
-
-    # Pairwise squared L2 distances: (B, B)
-    diff = features.unsqueeze(0) - features.unsqueeze(1)  # (B, B, D)
-    sq_dist = (diff ** 2).sum(dim=-1)                       # (B, B)
-
-    # Mask out diagonal (self-pairs)
-    mask = ~torch.eye(B, dtype=torch.bool, device=features.device)
-    sq_dist_masked = sq_dist[mask].reshape(B, B - 1)
-
-    # Log-mean-exp for numerical stability
-    log_exp = -sq_dist_masked / temperature                 # (B, B-1)
-    loss = torch.logsumexp(log_exp.reshape(-1), dim=0) - math.log(B * (B - 1))
-    return loss
-
-
-def dispersive_loss_infonce_cosine(features, temperature=0.5):
-    """
-    InfoNCE-based Dispersive Loss with Cosine Distance (Eq. 9 / 20).
-    
-    L_disp^{cos} = log( 1/(B(B-1)) Σ_i Σ_{j≠i} exp(-(1 - cos(h_i, h_j)) / τ) )
-    
-    Scale-invariant variant focusing on directional diversity.
-    """
-    B = features.shape[0]
-    if B < 2:
-        return torch.tensor(0.0, device=features.device)
-
-    # Normalize features
-    features_norm = F.normalize(features, p=2, dim=-1)
-
-    # Cosine similarity matrix: (B, B)
-    cos_sim = torch.mm(features_norm, features_norm.t())
-
-    # Cosine dissimilarity
-    cos_dissim = 1.0 - cos_sim
-
-    # Mask out diagonal
-    mask = ~torch.eye(B, dtype=torch.bool, device=features.device)
-    cos_dissim_masked = cos_dissim[mask].reshape(B, B - 1)
-
-    log_exp = -cos_dissim_masked / temperature
-    loss = torch.logsumexp(log_exp.reshape(-1), dim=0) - math.log(B * (B - 1))
-    return loss
-
-
-def dispersive_loss_hinge(features, margin=1.0):
-    """
-    Hinge Loss-based Dispersive Loss (Eq. 10 / 21).
-    
-    L_disp^{hinge} = 1/(B(B-1)) Σ_i Σ_{j≠i} max(0, ε - ||h_i - h_j||^2)^2
-    
-    Directly penalizes representations closer than margin threshold.
-    """
-    B = features.shape[0]
-    if B < 2:
-        return torch.tensor(0.0, device=features.device)
-
-    diff = features.unsqueeze(0) - features.unsqueeze(1)
-    sq_dist = (diff ** 2).sum(dim=-1)
-
-    mask = ~torch.eye(B, dtype=torch.bool, device=features.device)
-    sq_dist_masked = sq_dist[mask].reshape(B, B - 1)
-
-    hinge = F.relu(margin - sq_dist_masked) ** 2
-    loss = hinge.mean()
-    return loss
-
-
-DISPERSIVE_LOSS_VARIANTS = {
-    "infonce_l2": dispersive_loss_infonce_l2,
-    "infonce_cosine": dispersive_loss_infonce_cosine,
-    "hinge": dispersive_loss_hinge,
-}
-
 
 class D2PPOAgent:
     """
-    D²PPO Agent: Diffusion Policy Policy Optimization with Dispersive Loss.
+    D²PPO Agent: Diffusion Policy Policy Optimization.
     
     Follows the same interface as PPOAgent for compatibility with the F1Tenth
     training loop (train.py), but replaces the Gaussian policy with a diffusion
-    policy and adds dispersive loss regularization.
-    
-    Two-stage training:
-        1. pretrain_from_demonstrations() – supervised diffusion training + 
-           dispersive loss (Stage 1)
-        2. learn() – PPO fine-tuning with importance-sampled denoising steps
-           (Stage 2)
+    policy.  Pure RL — no supervised / BC pre-training.
     """
     def __init__(
         self,
@@ -139,16 +41,10 @@ class D2PPOAgent:
         params,
         transfer=(None, None),
         # Diffusion config
-        num_diffusion_steps=50,
+        num_diffusion_steps=25,
         beta_schedule="cosine",
-        # Dispersive loss config
-        dispersive_variant="infonce_l2",  # "infonce_l2", "infonce_cosine", "hinge"
-        dispersive_lambda=0.5,
-        dispersive_temperature=0.5,
-        dispersive_layer="late",          # "early", "mid", "late", or int/list
-        dispersive_hinge_margin=1.0,
         # PPO diffusion config
-        ppo_sample_steps=4,               # |S| – number of denoising steps to sample per PPO update
+        ppo_sample_steps=2,               # |S| – number of denoising steps to sample per PPO update
     ):
         # --- Hyperparameters ---
         torch.autograd.set_detect_anomaly(True)
@@ -159,7 +55,6 @@ class D2PPOAgent:
         self.gamma = 0.999            # Paper uses 0.999 (Table 6)
         self.gae_lambda = 0.95
         self.clip_epsilon = 0.1       # PPO clip (Table 6)
-        self.entropy_coeff = 0.01     # Table 6 uses 0.01
         self.max_grad_norm_actor = 0.5
         self.max_grad_norm_critic = 1.0
         self.state_dim = 4
@@ -168,23 +63,11 @@ class D2PPOAgent:
         self.image_size = 256
         self.minibatch_size = 512
         self.epochs = 10              # Table 6: 10 PPO epochs
-        self.epochs_with_demos = 4
-        self.bc_epochs = 3
         self.params = params
 
         # --- Diffusion config ---
         self.num_diffusion_steps = num_diffusion_steps
         self.ppo_sample_steps = ppo_sample_steps
-
-        # --- Dispersive loss config ---
-        self.dispersive_variant = dispersive_variant
-        self.dispersive_lambda = dispersive_lambda
-        self.dispersive_temperature = dispersive_temperature
-        self.dispersive_layer = dispersive_layer
-        self.dispersive_hinge_margin = dispersive_hinge_margin
-
-        # --- Demonstration Retention ---
-        self.demo_buffer = None
 
         # --- Waypoints for Raceline Reward ---
         self.waypoints_xy, self.waypoints_s, self.raceline_length = self._load_waypoints(map_name)
@@ -213,17 +96,14 @@ class D2PPOAgent:
             encoder=actor_encoder,
             num_diffusion_steps=num_diffusion_steps,
             time_emb_dim=32,
-            hidden_dims=(768, 768, 768),
+            hidden_dims=(512, 512, 512),
             beta_schedule=beta_schedule,
             odom_expand=64,
-            lstm_hidden_size=512,
+            lstm_hidden_size=256,
             lstm_num_layers=2,
             memory_length=350,
             memory_stride=20
         ).to(self.device)
-
-        # Register dispersive hooks for pre-training
-        self.actor_network.denoise_net.register_dispersive_hooks(self.dispersive_layer)
 
         # Critic (same as PPOAgent – not diffusion-based)
         self.critic_network = CriticNetwork(
@@ -254,8 +134,8 @@ class D2PPOAgent:
             os.makedirs(plot_dir)
 
         self.diagnostic_keys = [
-            "loss_actor", "loss_critic", "loss_diffusion", "loss_dispersive",
-            "entropy", "kl_approx", "clip_fraction", "collisions", "reward",
+            "loss_actor", "loss_critic",
+            "kl_approx", "clip_fraction", "collisions", "reward",
         ]
         self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
         self.generation_counter = 0
@@ -269,11 +149,7 @@ class D2PPOAgent:
         self.actor_hidden = self.actor_network.get_init_hidden(
             self.num_agents, self.device, transpose=True
         )
-
-    # -------------------------------------------------------------------
-    # Buffer / utility methods (same interface as PPOAgent)
-    # -------------------------------------------------------------------
-
+        
     def update_buffer_size(self, new_size):
         self.buffer = TensorDictReplayBuffer(storage=ListStorage(max_size=new_size))
         print(f"Updated replay buffer size to {new_size}")
@@ -281,11 +157,26 @@ class D2PPOAgent:
     def _transfer_weights(self, path, network):
         if path is None:
             return network.to(self.device)
+        if not os.path.exists(path):
+            print(f"Warning: checkpoint '{path}' not found — using random init.")
+            return network.to(self.device)
+
         checkpoint = torch.load(path, weights_only=False)
+
+        # Accept both raw state_dict (OrderedDict) and wrapped formats
+        if isinstance(checkpoint, dict):
+            state_dict_raw = checkpoint
+        elif isinstance(checkpoint, list):
+            print(f"Warning: '{path}' is a list (demos?), not a state_dict — skipping.")
+            return network.to(self.device)
+        else:
+            print(f"Warning: '{path}' has unexpected type {type(checkpoint).__name__} — skipping.")
+            return network.to(self.device)
+
         prefix = "0.module."
         state_dict = {}
-        for k, v in checkpoint.items():
-            if "log_std_head" in k:
+        for k, v in state_dict_raw.items():
+            if not isinstance(v, torch.Tensor):
                 continue
             if k.startswith(prefix):
                 state_dict[k[len(prefix):]] = v
@@ -299,9 +190,9 @@ class D2PPOAgent:
             }
             if filtered:
                 network.load_state_dict(filtered, strict=False)
-                print(f"Loaded {len(filtered)}/{len(net_sd)} compatible weight tensors.")
+                print(f"Loaded {len(filtered)}/{len(net_sd)} compatible weight tensors from '{path}'.")
             else:
-                print("No compatible weights found in checkpoint.")
+                print(f"No compatible weights found in '{path}'.")
         return network.to(self.device)
 
     def _transfer_vision(self, path):
@@ -332,18 +223,31 @@ class D2PPOAgent:
         return waypoints_xy, waypoints_s, raceline_length
 
     def _obs_to_tensors(self, obs):
-        scans = obs["scans"][: self.num_agents]
-        scan_tensors = torch.from_numpy(np.array(scans, dtype=np.float64)).float().unsqueeze(1)
-        state_data = np.stack(
-            (
-                obs["linear_vels_x"],
-                obs["linear_vels_y"],
-                obs["ang_vels_z"],
-                obs["linear_accel_x"],
-            ),
-            axis=1,
-        )
-        state_tensor = torch.from_numpy(state_data).float()[: self.num_agents]
+        # Robustly handle several possible shapes returned by the environment:
+        # - (num_agents, scan_len)
+        # - (num_timesteps, num_agents, scan_len) (pick last timestep)
+        scans_arr = np.array(obs["scans"])
+        if scans_arr.ndim >= 3 and scans_arr.shape[0] != self.num_agents and scans_arr.shape[1] == self.num_agents:
+            # e.g., (T, N, scan_len) -> take last timestep
+            scans_arr = scans_arr[-1]
+        scans_arr = scans_arr[: self.num_agents]
+        scan_tensors = torch.from_numpy(scans_arr.astype(np.float32)).unsqueeze(1)
+
+        # State fields may also be time-major (T, N). Handle similarly.
+        def last_or_first(arr):
+            a = np.array(arr)
+            if a.ndim > 1 and a.shape[0] != self.num_agents and a.shape[1] == self.num_agents:
+                return a[-1]
+            return a
+
+        lvx = last_or_first(obs["linear_vels_x"])[: self.num_agents]
+        lvy = last_or_first(obs["linear_vels_y"])[: self.num_agents]
+        avz = last_or_first(obs["ang_vels_z"])[: self.num_agents]
+        lax = last_or_first(obs["linear_accel_x"])[: self.num_agents]
+
+        state_data = np.stack((lvx, lvy, avz, lax), axis=1)
+        state_tensor = torch.from_numpy(state_data.astype(np.float32))
+
         return scan_tensors.to(self.device), state_tensor.to(self.device)
 
     def reset_buffers(self, agent_indices=None):
@@ -369,11 +273,7 @@ class D2PPOAgent:
                 h[idx] = 0.0
                 c[idx] = 0.0
             self.actor_hidden = (h, c)
-
-    # -------------------------------------------------------------------
-    # Action selection
-    # -------------------------------------------------------------------
-
+    
     def get_action_and_value(self, scan_tensor, state_tensor, deterministic=False, store=True):
         """
         Sample an action from the diffusion policy and compute state value.
@@ -390,18 +290,19 @@ class D2PPOAgent:
 
         with torch.no_grad():
             # Encode observation through CNN + LSTM
-            obs_features, new_buffer, new_h, new_c = self.actor_network.encode_observation(
-                scan_tensor[: self.num_agents],
-                state_tensor[: self.num_agents],
-                self.actor_buffer[-1],
-                self.actor_hidden[0],
-                self.actor_hidden[1],
-            )
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                obs_features, new_buffer, new_h, new_c = self.actor_network.encode_observation(
+                    scan_tensor[: self.num_agents],
+                    state_tensor[: self.num_agents],
+                    self.actor_buffer[-1],
+                    self.actor_hidden[0],
+                    self.actor_hidden[1],
+                )
 
-            # Sample action via full reverse diffusion
-            action, chain, log_prob = self.actor_network.sample_action_with_chain(
-                obs_features, deterministic=deterministic
-            )
+                # Sample action via full reverse diffusion
+                action, chain, log_prob = self.actor_network.sample_action_with_chain(
+                    obs_features, deterministic=deterministic
+                )
 
             # Value estimate (critic is feedforward — no temporal state)
             value = self.critic_network(
@@ -411,14 +312,11 @@ class D2PPOAgent:
 
             # Advance temporal state only during rollout collection
             if store:
-                self.actor_buffer = new_buffer
+                self.actor_buffer.append(new_buffer)
                 self.actor_hidden = (new_h, new_c)
 
         return action, log_prob, value
 
-    # -------------------------------------------------------------------
-    # Transition storage
-    # -------------------------------------------------------------------
 
     def store_transition(self, obs, next, action, log_prob, reward, done, value):
         next_scans, next_states = self._obs_to_tensors(next)
@@ -447,10 +345,6 @@ class D2PPOAgent:
             batch_size=[self.num_agents],
         )
         self.buffer.add(step_data.to(self.device))
-
-    # -------------------------------------------------------------------
-    # GAE computation (identical to PPOAgent)
-    # -------------------------------------------------------------------
 
     def _compute_gae(self, data):
         rewards = data.get(("next", "reward")).to(self.device)
@@ -488,10 +382,6 @@ class D2PPOAgent:
         data.set("advantage", advantages)
         data.set("value_target", returns)
         return data
-
-    # -------------------------------------------------------------------
-    # Reward calculation (same as PPOAgent)
-    # -------------------------------------------------------------------
 
     def _project_to_raceline(self, current_pos, start_idx, lookahead):
         wp_count = len(self.waypoints_xy)
@@ -562,167 +452,8 @@ class D2PPOAgent:
             self.current_lap_count[i] = 0
             self.last_checkpoint[i] = 0
 
-    # ===================================================================
-    # STAGE 1: Pre-training with Dispersive Loss
-    # ===================================================================
-
-    def _compute_dispersive_loss(self, features_dict):
-        """
-        Compute dispersive loss averaged over hooked layers and denoising
-        timesteps (Eq. 7).
-        
-        L_disp = (1/K) Σ_{k=1}^{K} L_disp_variant(H_k)
-        
-        In practice, features_dict maps layer_idx → features from a single
-        forward pass at one denoising timestep. We call this function once per
-        sampled timestep and average outside.
-        """
-        loss_fn = DISPERSIVE_LOSS_VARIANTS[self.dispersive_variant]
-        total = torch.tensor(0.0, device=self.device)
-        count = 0
-
-        for layer_idx, features in features_dict.items():
-            # Global average pooling if features are high-dimensional
-            if features.ndim > 2:
-                features = features.mean(dim=list(range(1, features.ndim - 1)))
-
-            if self.dispersive_variant == "hinge":
-                total = total + loss_fn(features, margin=self.dispersive_hinge_margin)
-            else:
-                total = total + loss_fn(features, temperature=self.dispersive_temperature)
-            count += 1
-
-        return total / max(count, 1)
-
-    def pretrain_from_demonstrations(self, demo_buffer=None, epochs=100, gradient_accumulation_steps=4, bc_weights=None):
-        """
-        Stage 1: Pre-training with diffusion loss + dispersive loss.
-        
-        L_{D2PPO}^{pre-train} = L_diff + λ · L_disp   (Eq. 6)
-        
-        Uses expert demonstrations to train the diffusion policy's noise
-        prediction network while encouraging representational diversity via
-        dispersive loss on intermediate MLP features.
-        """
-        if demo_buffer is not None:
-            self.demo_buffer = demo_buffer
-            print(f"\n[D²PPO Stage 1] Pre-training from {len(self.demo_buffer)} demonstrations...")
-            print(f"  Dispersive variant: {self.dispersive_variant}, λ={self.dispersive_lambda}")
-            print(f"  Layer hook: {self.dispersive_layer}, τ={self.dispersive_temperature}")
-            bc_weights = (1.0, 1.0)
-        elif demo_buffer is None and self.demo_buffer is not None:
-            demo_buffer = self.demo_buffer
-            print(f"\n  [D²PPO] BC regularisation from stored {len(self.demo_buffer)} demos...")
-        else:
-            print("[D²PPO] No demonstrations available for pre-training.")
-            return
-
-        # Ensure hooks are registered
-        self.actor_network.denoise_net.register_dispersive_hooks(self.dispersive_layer)
-
-        self.actor_network.train()
-        total_diff_loss = 0.0
-        total_disp_loss = 0.0
-
-        for epoch in range(epochs):
-            epoch_diff = 0.0
-            epoch_disp = 0.0
-            self.actor_optimizer.zero_grad()
-            update_counter = 0
-
-            # Reset temporal state at the start of each epoch
-            demo_buffer_obs = None
-            demo_hidden = (None, None)
-
-            for i, d in enumerate(demo_buffer):
-                # Prepare single-sample batch
-                scan = torch.from_numpy(d["scan"]).float().unsqueeze(0).to(self.device)
-                state = torch.from_numpy(d["state"]).float().unsqueeze(0).to(self.device)
-                action = torch.from_numpy(d["action"]).float().unsqueeze(0).to(self.device)
-
-                # Encode observation (track LSTM state across sequential demos)
-                obs_features, demo_buffer_obs, demo_h, demo_c = self.actor_network.encode_observation(
-                    scan, state, demo_buffer_obs, demo_hidden[0], demo_hidden[1]
-                )
-
-                # Detach temporal state to prevent backprop through entire sequence
-                demo_buffer_obs = demo_buffer_obs.detach()
-                demo_hidden = (demo_h.detach(), demo_c.detach())
-
-                # --- Diffusion loss ---
-                diff_loss = self.actor_network.compute_diffusion_loss(action, obs_features)
-
-                # --- Dispersive loss (on intermediate features from denoise forward pass) ---
-                # The diffusion_loss call already triggered the denoise_net forward pass;
-                # however, we also need per-timestep features. We do an extra explicit pass:
-                B = action.shape[0]
-                t_rand = torch.randint(0, self.num_diffusion_steps, (B,), device=self.device)
-                noise = torch.randn_like(action)
-                noisy_action = self.actor_network.q_sample(action, t_rand, noise=noise)
-                _ = self.actor_network.denoise_net(noisy_action, obs_features, t_rand)
-                feat_dict = self.actor_network.denoise_net.get_intermediate_features()
-                disp_loss = self._compute_dispersive_loss(feat_dict)
-
-                # Combined loss (Eq. 6)
-                loss = (diff_loss + self.dispersive_lambda * disp_loss) / gradient_accumulation_steps
-                loss.backward()
-
-                epoch_diff += diff_loss.item()
-                epoch_disp += disp_loss.item()
-
-                update_counter += 1
-                if update_counter >= gradient_accumulation_steps:
-                    nn.utils.clip_grad_norm_(self.actor_network.parameters(), self.max_grad_norm_actor)
-                    self.actor_optimizer.step()
-                    self.actor_optimizer.zero_grad()
-                    update_counter = 0
-
-                if (i + 1) % 100 == 0:
-                    progress = (i + 1) / len(demo_buffer) * 100
-                    print(
-                        f"    Epoch {epoch+1}/{epochs} [{progress:.0f}%] "
-                        f"Diff: {epoch_diff/(i+1):.4f}  Disp: {epoch_disp/(i+1):.4f}",
-                        end="\r",
-                    )
-
-            # Final gradient step
-            if update_counter > 0:
-                nn.utils.clip_grad_norm_(self.actor_network.parameters(), self.max_grad_norm_actor)
-                self.actor_optimizer.step()
-                self.actor_optimizer.zero_grad()
-
-            n = len(demo_buffer)
-            avg_diff = epoch_diff / n
-            avg_disp = epoch_disp / n
-            total_diff_loss += avg_diff
-            total_disp_loss += avg_disp
-            print(
-                f"    Epoch {epoch+1}/{epochs}: Diff Loss={avg_diff:.4f}, "
-                f"Disp Loss={avg_disp:.4f}, Combined={avg_diff + self.dispersive_lambda*avg_disp:.4f}"
-            )
-
-        self.buffer.empty()
-        print(
-            f"[D²PPO Stage 1] Complete. Avg Diff Loss: {total_diff_loss/epochs:.4f}, "
-            f"Avg Disp Loss: {total_disp_loss/epochs:.4f}\n"
-        )
-
-    # ===================================================================
-    # STAGE 2: PPO Fine-tuning for Diffusion Policies
-    # ===================================================================
-
     def learn(self, collisions, reward):
-        """
-        Stage 2: PPO fine-tuning with importance-sampled denoising steps.
-        
-        Adapts the standard PPO clipped objective for diffusion policies
-        by computing probability ratios at sampled denoising timesteps and
-        accumulating gradients via the chain rule (Eq. 13-14, 34).
-        
-        L_{D2PPO}(θ) = E_t[ Σ_{k∈S} (K / (|S|·p(k))) 
-                         min(r_t^(k)(θ) Â_t^(k), clip(r_t^(k)(θ), 1-ε, 1+ε) Â_t^(k)) ]
-        """
-        print("[D²PPO Stage 2] Starting PPO fine-tuning...")
+        print("Starting PPO learning...")
         print(f"  Buffer size: {len(self.buffer)}")
 
         data = self.buffer.sample(batch_size=len(self.buffer))
@@ -812,11 +543,16 @@ class D2PPOAgent:
 
                 # --- Actor: importance-sampled denoising-step PPO ---
                 # Sample a subset S of denoising timesteps (Eq. 14)
-                sampled_k = torch.randint(1, K + 1, (S_size,), device=self.device)
-                # Uniform sampling probability: p(k) = 1/K
-                importance_weight = K / S_size  # K / (|S| * p(k)) with p(k)=1/K
+                # Valid denoising transitions are t=1→0, t=2→1, ..., t=K-1→K-2
+                # so t ∈ {1, ..., K-1} (schedule indices are 0-based, 0 to K-1)
+                sampled_k = torch.randint(1, K, (S_size,), device=self.device)
+                # Uniform sampling probability: p(k) = 1/(K-1)
+                importance_weight = (K - 1) / S_size
 
                 total_policy_loss = torch.tensor(0.0, device=self.device)
+
+                # Normalise stored raw actions into [-1,1] for diffusion
+                actions_norm = self.actor_network.normalize_action(actions)
 
                 for k_val in sampled_k:
                     k = k_val.item()
@@ -824,15 +560,15 @@ class D2PPOAgent:
                     t_prev = t - 1  # k-1
 
                     # Forward diffusion to get a^k from clean action a^0
-                    noise = torch.randn_like(actions)
-                    a_k = self.actor_network.q_sample(actions, t, noise=noise)
+                    noise = torch.randn_like(actions_norm)
+                    a_k = self.actor_network.q_sample(actions_norm, t, noise=noise)
 
                     # Use DDPM posterior to get a^{k-1} (the "observed" previous step)
                     # a^{k-1} = q(a^{k-1}|a^0, a^k) — this is the target of the denoising step
                     if k > 1:
-                        a_k_minus_1 = self.actor_network.q_sample(actions, t_prev, noise=noise)
+                        a_k_minus_1 = self.actor_network.q_sample(actions_norm, t_prev, noise=noise)
                     else:
-                        a_k_minus_1 = actions  # a^0
+                        a_k_minus_1 = actions_norm  # a^0
 
                     # Current policy log-prob: log p_θ(a^{k-1}|a^k, s)
                     new_log_prob_k = self.actor_network.compute_denoising_log_prob(
@@ -860,19 +596,9 @@ class D2PPOAgent:
                 # Average over sampled steps
                 policy_loss = total_policy_loss / S_size
 
-                # --- Entropy bonus (approximate via diffusion noise level) ---
-                # For diffusion policies, entropy is implicitly controlled by the
-                # stochasticity of the denoising process. We add a small regularizer
-                # based on the predicted noise magnitude diversity.
-                with torch.no_grad():
-                    t_entropy = torch.randint(0, K, (B,), device=self.device)
-                    noise_ent = torch.randn_like(actions)
-                    noisy_ent = self.actor_network.q_sample(actions, t_entropy, noise=noise_ent)
-                pred_noise_ent = self.actor_network.predict_noise(noisy_ent, obs_features, t_entropy)
-                entropy_proxy = pred_noise_ent.var(dim=0).mean()  # Higher variance → more diverse predictions
-                entropy_loss = -self.entropy_coeff * entropy_proxy
-
-                actor_loss = policy_loss + entropy_loss
+                # Diffusion policies control exploration implicitly through
+                # stochastic denoising — no explicit entropy bonus needed.
+                actor_loss = policy_loss
 
                 # --- Backward & update ---
                 self.actor_scaler.scale(actor_loss).backward()
@@ -906,9 +632,6 @@ class D2PPOAgent:
 
                 current_gen_diagnostics["loss_actor"].append(actor_loss.item())
                 current_gen_diagnostics["loss_critic"].append(critic_loss.item())
-                current_gen_diagnostics["loss_diffusion"].append(0.0)  # Not used in Stage 2
-                current_gen_diagnostics["loss_dispersive"].append(0.0)
-                current_gen_diagnostics["entropy"].append(entropy_proxy.item())
                 current_gen_diagnostics["kl_approx"].append(kl_approx)
                 current_gen_diagnostics["clip_fraction"].append(clip_frac)
 
@@ -938,10 +661,6 @@ class D2PPOAgent:
         del data
         torch.cuda.empty_cache()
         print("[D²PPO Stage 2] Learning complete.")
-
-    # -------------------------------------------------------------------
-    # Diagnostics plotting
-    # -------------------------------------------------------------------
 
     def _plot_historical_diagnostics(self):
         keys_to_plot = [

@@ -5,7 +5,7 @@ from baselines.pure_pursuit import PurePursuit
 from baselines.gap_follow import GapFollow
 from baselines.gap_follow_pure_pursuit import GapFollowPurePursuit
 from baselines.sim_pure_pursuit import SimPurePursuit
-from supervised_agent import SupervisedAgent
+from D2PPO_agent import D2PPOAgent
 import torch
 import os
 from utils.utils import *
@@ -173,7 +173,7 @@ def race(agent, map, lap_count=10, speed_cap=None, old_lstm=False):
         print(f"{lap_time:.2f}s: Speed: {next_obs['linear_vels_x'][0]:.2f}", end='\r')
 
 # --- Agent Setup ---
-supervised = SupervisedAgent(
+supervised = D2PPOAgent(
     num_agents=NUM_AGENTS_TEST,
     map_name=MAP_NAME,
     steps=None,

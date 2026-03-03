@@ -25,14 +25,19 @@ def linear_beta_schedule(num_timesteps, beta_start=1e-4, beta_end=0.02):
 
 def extract(a, t, x_shape):
     """Extract coefficients at timesteps *t*, reshaped for broadcasting."""
+    # Ensure t is a 1-D long tensor of shape (batch,)
+    if t.dim() != 1:
+        t = t.reshape(-1)
     batch_size = t.shape[0]
-    out = a.gather(-1, t)
+
+    if a.dim() == 1:
+        out = a[t]
+    else:
+        idx = t.view(batch_size, *([1] * (a.dim() - 1))).expand(batch_size, *a.shape[1:])
+        out = a.gather(0, idx)
+
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
 
-
-# ===========================================================================
-# Sinusoidal Positional Embedding (for diffusion timestep conditioning)
-# ===========================================================================
 
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embedding for diffusion timestep *t*."""
@@ -48,10 +53,6 @@ class SinusoidalPosEmb(nn.Module):
         emb = t[:, None].float() * emb[None, :]
         return torch.cat([emb.sin(), emb.cos()], dim=-1)
 
-
-# ===========================================================================
-# Conditional Denoising MLP (ε_θ network)
-# ===========================================================================
 
 class ConditionalDenoisingMLP(nn.Module):
     """
