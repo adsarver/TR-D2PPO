@@ -253,8 +253,9 @@ class DiffusionLSTM(nn.Module):
         return 2.0 * (action - self.action_lo) / (self.action_hi - self.action_lo + 1e-8) - 1.0
 
     def denormalize_action(self, action_norm):
-        """Map normalised action from [-1, 1] → [action_lo, action_hi]."""
-        return (action_norm + 1.0) * 0.5 * (self.action_hi - self.action_lo) + self.action_lo
+        """Map normalised action from [-1, 1] → [action_lo, action_hi], clamped."""
+        raw = (action_norm + 1.0) * 0.5 * (self.action_hi - self.action_lo) + self.action_lo
+        return raw.clamp(self.action_lo.unsqueeze(0), self.action_hi.unsqueeze(0))
 
     # ------------------------------------------------------------------
     # Forward / reverse diffusion helpers

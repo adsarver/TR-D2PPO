@@ -42,9 +42,9 @@ STEPS_PER_GENERATION = 1024
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = None # Generated later
-CURRENT_MAP = "BrandsHatch" # Starting map, used for pretraining
+CURRENT_MAP = "Sepang" # Starting map, used for pretraining
 PATIENCE = 200  # Early stopping patience
-GEN_PER_MAP = 10
+GEN_PER_MAP = 1
 
 def get_curriculum_map_pool(generation, selector=None):
     """Returns the appropriate map pool based on training progress."""
@@ -87,7 +87,7 @@ if hasattr(torch, 'compile'):
     agent.actor_network = torch.compile(agent.actor_network)
     agent.critic_network = torch.compile(agent.critic_network)
 
-STEPS_PER_GENERATION = int((agent.raceline_length / 7) * 100)
+STEPS_PER_GENERATION = int((agent.raceline_length / 7) * 201)  # Adjust steps based on raceline length and desired time per generation
 agent.update_buffer_size(STEPS_PER_GENERATION)
 print(f"Adjusted steps per generation to {STEPS_PER_GENERATION} based on raceline length.")
 
@@ -199,7 +199,6 @@ Collisions: {collisions}, \
 Max vel: {np.max(next_obs['linear_vels_x'][:NUM_AGENTS_AI]):.1f} m/s, \
 Max actor_vel: {torch.max(action_tensor[:,1]).item():.1f} m/s, \
 Ego Speed: {next_obs['linear_vels_x'][0]:.2f} \
-Max Accel: {np.max(np.abs(next_obs['linear_accel_x'][:NUM_AGENTS_AI])):.2f} m/s², \
 Avg Reward: {sum(total_reward_this_gen) / (step + 1):.3f} \
 S/s: {1 / (time.time() - timer):.1f}", end='\r')
         

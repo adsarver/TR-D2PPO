@@ -113,8 +113,10 @@ class D2PPOAgent:
         self.LAP_REWARD = 80.0
         self.CHECKPOINT_REWARD = self.LAP_REWARD * 0.1
         self.COLLISION_PENALTY = -4.0
-        self.SPEED_REWARD = 3.0
+        self.SPEED_REWARD = 5.0
         self.AGENT_COLLISION_PENALTY = -2.0
+        self.NUM_CHECKPOINTS = 10
+        self._prev_lap_counts = np.zeros(self.num_agents, dtype=int)
 
         # --- Networks ---
         actor_encoder = self._transfer_vision(transfer[0])
@@ -172,7 +174,7 @@ class D2PPOAgent:
 
         self.diagnostic_keys = [
             "loss_actor", "loss_critic", "loss_diffusion",
-            "loss_dispersive", "adv_weight_mean", "collisions", "reward",
+            "loss_dispersive", "adv_weight_mean", "collisions", "reward", "avg_speed"
         ]
         self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
         self.generation_counter = 0
@@ -186,6 +188,11 @@ class D2PPOAgent:
         self.actor_hidden = self.actor_network.get_init_hidden(
             self.num_agents, self.device, transpose=True
         )
+
+        # For computing acceleration from consecutive velocity observations
+        # (the sim's linear_accel_x is always 0)
+        self._prev_vels_x = np.zeros(self.num_agents)
+        self._sim_dt = 0.01  # f110_gym default timestep
         
     def update_buffer_size(self, new_size):
         self.buffer = TensorDictReplayBuffer(storage=ListStorage(max_size=new_size))
@@ -202,6 +209,7 @@ class D2PPOAgent:
             self.actor_hidden = self.actor_network.get_init_hidden(
                 self.num_agents, self.device, transpose=True
             )
+            self._prev_vels_x = np.zeros(self.num_agents)
         else:
             agent_indices = agent_indices[agent_indices < self.num_agents]
             # Per-agent reset: zero out specific agent slots
@@ -214,6 +222,7 @@ class D2PPOAgent:
                 h[idx] = 0.0
                 c[idx] = 0.0
             self.actor_hidden = (h, c)
+            self._prev_vels_x[agent_indices] = 0.0
     
     def get_action_and_value(self, scan_tensor, state_tensor, deterministic=False, store=True):
         """
@@ -250,10 +259,21 @@ class D2PPOAgent:
                     self.actor_hidden[1],
                 )
 
-                # Sample action via full reverse diffusion (with inline log_prob)
-                action, chain, log_prob = self.actor_network.sample_action_with_chain(
-                    obs_features, deterministic=deterministic
-                )
+            # Run reverse diffusion in float32 — the 25-step iterative
+            # chain accumulates rounding errors that overflow in float16.
+            obs_features_f32 = obs_features.float()
+            action, chain, log_prob = self.actor_network.sample_action_with_chain(
+                obs_features_f32, deterministic=deterministic
+            )
+
+            # Safety: clamp to valid action range & replace any residual NaN
+            action = action.clamp(
+                self.actor_network.action_lo.unsqueeze(0),
+                self.actor_network.action_hi.unsqueeze(0),
+            )
+            if torch.isnan(action).any():
+                print("[WARNING] NaN in sampled action — replacing with zeros")
+                action = torch.nan_to_num(action, nan=0.0)
 
             # Advance temporal state
             self.actor_buffer.append(new_buffer)
@@ -299,13 +319,60 @@ class D2PPOAgent:
     def calculate_reward(self, next_obs):
         collisions = np.array(next_obs["collisions"][:self.num_agents])
         speeds = np.array(next_obs["linear_vels_x"][:self.num_agents])
+        positions = np.stack([
+            np.array(next_obs['poses_x'][:self.num_agents]),
+            np.array(next_obs['poses_y'][:self.num_agents]),
+        ], axis=1)
         wall_collisions = collisions == 1
         agent_collisions = collisions == 2
         rewards = np.zeros(self.num_agents)
 
+        # --- PROGRESS REWARD ---
+        for i in range(self.num_agents):
+            projected_s, new_wp_idx = self._project_to_raceline(
+                positions[i],
+                self.last_wp_index[i],
+                lookahead=50,
+            )
+
+            # Guard against NaN positions (e.g. from NaN actions)
+            if np.isnan(projected_s):
+                projected_s = self.last_cumulative_distance[i]
+                new_wp_idx = self.last_wp_index[i]
+
+            progress = projected_s - self.last_cumulative_distance[i]
+            if progress < -self.raceline_length / 2:
+                progress += self.raceline_length   # crossed start/finish
+            elif progress > self.raceline_length / 2:
+                progress -= self.raceline_length   # went backwards
+
+            if progress > 0:
+                rewards[i] += progress * self.PROGRESS_REWARD_SCALAR
+            else:
+                rewards[i] += progress * self.PROGRESS_REWARD_SCALAR * 2.0  # penalise reversing harder
+
+            # --- Checkpoint reward (divide track into NUM_CHECKPOINTS segments) ---
+            segment_len = self.raceline_length / self.NUM_CHECKPOINTS
+            new_ckpt = int(projected_s / segment_len) % self.NUM_CHECKPOINTS
+            if new_ckpt != self.last_checkpoint[i]:
+                rewards[i] += self.CHECKPOINT_REWARD
+                self.last_checkpoint[i] = new_ckpt
+
+            self.last_cumulative_distance[i] = projected_s
+            self.last_wp_index[i] = new_wp_idx
+
+        # --- SPEED BONUS vs GFPP reference ---
         target_speed = self.gfpp.get_actions_batch(next_obs)
         speed_bonus = (speeds - target_speed[:self.num_agents, 1]) * self.SPEED_REWARD
         rewards += speed_bonus
+
+        # --- LAP COMPLETION REWARD ---
+        lap_counts = np.array(next_obs['lap_counts'][:self.num_agents], dtype=int)
+        laps_completed = lap_counts - self._prev_lap_counts
+        rewards += np.clip(laps_completed, 0, 1) * self.LAP_REWARD
+        self._prev_lap_counts = lap_counts.copy()
+
+        # --- COLLISION PENALTIES ---
         rewards += wall_collisions * self.COLLISION_PENALTY
         rewards += agent_collisions * (self.AGENT_COLLISION_PENALTY * 0.5)
 
@@ -325,6 +392,7 @@ class D2PPOAgent:
                 self.start_s[i] = self.waypoints_s[closest]
                 self.current_lap_count[i] = 0
                 self.last_checkpoint[i] = 0
+                self._prev_lap_counts[i] = 0
             return
 
         for i in range(self.num_agents):
@@ -336,6 +404,7 @@ class D2PPOAgent:
             self.start_s[i] = self.waypoints_s[closest]
             self.current_lap_count[i] = 0
             self.last_checkpoint[i] = 0
+        self._prev_lap_counts[:] = 0
 
     def learn(self, collisions, reward):
         """Advantage-Weighted Diffusion Regression + Diffusion Regulariser.
@@ -376,6 +445,7 @@ class D2PPOAgent:
 
         self.actor_network.train()
         self.critic_network.train()
+        
 
         # Flush stale intermediate features accumulated during rollout.
         # The diffusion_utils ConditionalDenoisingMLP appends to a list on
@@ -409,6 +479,7 @@ class D2PPOAgent:
                 advantages = advantages_all[mb_idx]
                 value_targets = value_targets_all[mb_idx]
                 old_values = old_values_all[mb_idx]
+                speeds = np.array(obs_state[:, 1], dtype=np.float32)
 
                 # Flatten agents dimension if present: [T, A, ...] → [T*A, ...]
                 if obs_scan.ndim == 4:  # [T, A, 1, beams]
@@ -535,6 +606,7 @@ class D2PPOAgent:
                 current_gen_diagnostics["loss_diffusion"].append(diff_reg.item())
                 current_gen_diagnostics["loss_dispersive"].append(disp_loss.item())
                 current_gen_diagnostics["adv_weight_mean"].append(weights.mean().item())
+                current_gen_diagnostics["avg_speed"].append(speeds[mb_idx].mean().item())
 
             if num_updates > 0:
                 print(
@@ -762,7 +834,12 @@ class D2PPOAgent:
         lvx = last_or_first(obs["linear_vels_x"])[: self.num_agents]
         lvy = last_or_first(obs["linear_vels_y"])[: self.num_agents]
         avz = last_or_first(obs["ang_vels_z"])[: self.num_agents]
-        lax = last_or_first(obs["linear_accel_x"])[: self.num_agents]
+
+        # Compute acceleration from consecutive velocities
+        # (sim's linear_accel_x is always 0)
+        lax = (lvx - self._prev_vels_x) / self._sim_dt
+        lax = np.clip(lax, -10.0, 10.0)  # Match normalisation range
+        self._prev_vels_x = lvx.copy()
 
         state_data = np.stack((lvx, lvy, avz, lax), axis=1)
         state_tensor = torch.from_numpy(state_data.astype(np.float32))
