@@ -106,7 +106,7 @@ def _collect_single_map(
         wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
         max_steering=PARAMS_DICT['s_max'],
         max_speed=8.0,
-        min_speed=1.5,
+        min_speed=0.5,
         num_beams=NUM_BEAMS,
         fov=LIDAR_FOV,
     )
@@ -118,6 +118,12 @@ def _collect_single_map(
 
     for step in range(steps_per_map):
         actions = expert.get_actions_batch(obs)  # (N, 2)
+
+        next_obs, _, _, _ = env.step(actions)
+
+        # Collision / stuck detection
+        collisions = np.array(next_obs["collisions"][:num_agents])
+        velocities = np.array(next_obs["linear_vels_x"][:num_agents])
 
         for a_idx in range(num_agents):
             scan_np = np.asarray(obs["scans"][a_idx], dtype=np.float32)
@@ -134,13 +140,14 @@ def _collect_single_map(
                 "state":  state_np,
                 "action": action_np,
                 "map":    map_name,
+                # Reward-relevant fields (for critic pretraining)
+                "step":   step,
+                "agent":  a_idx,
+                "next_velocity":  float(velocities[a_idx]),
+                "next_collision": int(collisions[a_idx]),
             })
 
-        next_obs, _, _, _ = env.step(actions)
-
-        # Collision / stuck detection → reset
-        collisions = np.array(next_obs["collisions"][:num_agents])
-        velocities = np.array(next_obs["linear_vels_x"][:num_agents])
+        # Stuck detection → reset
         stuck = (collisions == 1) | (np.abs(velocities) < 0.1)
         collision_timers[stuck] += 1
         collision_timers[~stuck] = 0
@@ -368,6 +375,197 @@ def pretrain(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Critic pre-training  (uses same demos, proxy reward → MC returns)
+# ──────────────────────────────────────────────────────────────────────
+
+def pretrain_critic(
+    demos: list[dict],
+    actor_state_dict: dict,
+    epochs: int = 30,
+    batch_size: int = 256,
+    lr: float = 5e-4,
+    gamma: float = 0.999,
+    speed_reward_scale: float = 0.10,
+    collision_penalty: float = -4.0,
+    save_dir: str = "models/critic/pretrained",
+    save_name: str = "critic_pretrained.pt",
+    device: str | torch.device = "cuda",
+):
+    """
+    Pre-train the CriticNetwork value function on MC returns computed from
+    a proxy reward derived from the same expert demonstrations used for
+    actor pretraining.
+
+    Proxy reward per transition:
+        r = next_velocity * speed_reward_scale
+            + next_collision * collision_penalty
+
+    The critic's CNN (vision encoder) is initialised from the pretrained
+    actor weights and frozen; only the LSTM, projection, and value-head
+    layers are trained.
+
+    Falls back to ``state[0]`` (vel_x) when demos lack ``next_velocity``
+    (backward compat with older demo files).
+    """
+    from models.CriticNetworks import CriticNetwork
+    from models.AuxModels import VisionEncoder
+
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    print(f"\n{'=' * 60}")
+    print("  CRITIC PRE-TRAINING  (weight_initializer)")
+    print(f"{'=' * 60}")
+    print(f"  {len(demos)} demos, {epochs} epochs, batch={batch_size}, "
+          f"lr={lr}, γ={gamma}")
+
+    has_reward_fields = ("next_velocity" in demos[0])
+    if not has_reward_fields:
+        print("  ⚠ Demos lack next_velocity/next_collision — using state vel_x proxy.")
+
+    # ── 1. Build CriticNetwork with pretrained vision encoder ────────
+    encoder = VisionEncoder(num_scan_beams=NUM_BEAMS)
+    # Transfer actor CNN weights to critic encoder
+    prefixes = ["conv_layers.", "vision_encoder.",
+                "0.module.conv_layers.", "0.module.vision_encoder."]
+    encoder_sd = {}
+    for k, v in actor_state_dict.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        for prefix in prefixes:
+            if k.startswith(prefix):
+                encoder_sd[k[len(prefix):]] = v
+                break
+    if encoder_sd:
+        ref_sd = encoder.state_dict()
+        filtered = {k: v for k, v in encoder_sd.items()
+                    if k in ref_sd and ref_sd[k].shape == v.shape}
+        if filtered:
+            encoder.load_state_dict(filtered, strict=False)
+            print(f"  Loaded {len(filtered)}/{len(ref_sd)} actor CNN weights "
+                  f"into critic encoder.")
+
+    critic = CriticNetwork(
+        state_dim=STATE_DIM,
+        encoder=encoder,
+        lstm_hidden_size=64,
+        lstm_num_layers=2,
+        memory_length=48,
+        memory_stride=100,
+        odom_expand=64,
+        proj_hidden=256,
+    ).to(device)
+
+    # Freeze vision encoder (already pretrained)
+    for p in critic.conv_layers.parameters():
+        p.requires_grad = False
+
+    # ── 2. Reconstruct trajectories & compute MC returns ─────────────
+    # Group demos by (map, agent) to get per-agent time-ordered sequences.
+    from collections import defaultdict
+    trajectories = defaultdict(list)
+    for d in demos:
+        key = (d["map"], d.get("agent", 0))
+        trajectories[key].append(d)
+
+    # Sort each trajectory by step index
+    for key in trajectories:
+        trajectories[key].sort(key=lambda x: x.get("step", 0))
+
+    all_scans = []
+    all_states = []
+    all_returns = []
+
+    for (map_name, agent_idx), traj in trajectories.items():
+        T = len(traj)
+        if T < 10:
+            continue
+
+        scans  = torch.stack([torch.from_numpy(d["scan"]) for d in traj]).unsqueeze(1)
+        states = torch.stack([torch.from_numpy(d["state"]) for d in traj])
+
+        # Compute per-step rewards
+        rewards = torch.zeros(T)
+        for t, d in enumerate(traj):
+            if has_reward_fields:
+                vel = d["next_velocity"]
+                col = d["next_collision"]
+            else:
+                vel = float(d["state"][0])   # vel_x as proxy
+                col = 0
+            rewards[t] = vel * speed_reward_scale + col * collision_penalty
+
+        # Normalise rewards per trajectory
+        r_std = rewards.std().clamp(min=1e-4)
+        rewards = rewards / r_std
+
+        # MC returns (reverse cumsum)
+        returns = torch.zeros(T)
+        G = 0.0
+        for t in reversed(range(T)):
+            G = rewards[t] + gamma * G
+            returns[t] = G
+
+        all_scans.append(scans)
+        all_states.append(states)
+        all_returns.append(returns)
+
+    X_scans  = torch.cat(all_scans,  dim=0).to(device)
+    X_states = torch.cat(all_states, dim=0).to(device)
+    Y_returns = torch.cat(all_returns, dim=0).to(device)
+    N = X_scans.shape[0]
+    print(f"  Reconstructed {len(trajectories)} trajectories → {N} samples")
+
+    # ── 3. Supervised training ───────────────────────────────────────
+    critic.train()
+    optim_c = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, critic.parameters()),
+        lr=lr, weight_decay=0.01,
+    )
+
+    best_loss = float("inf")
+    os.makedirs(save_dir, exist_ok=True)
+
+    for epoch in range(1, epochs + 1):
+        perm = torch.randperm(N, device=device)
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for i in range(0, N, batch_size):
+            idx = perm[i:i + batch_size]
+            s  = X_scans[idx]
+            st = X_states[idx]
+            y  = Y_returns[idx]
+
+            feat, _, _, _ = critic.encode_observation(s, st, obs_buffer=None)
+            pred = critic.fc_layers(feat).squeeze(-1)
+            loss = F.smooth_l1_loss(pred, y)
+
+            optim_c.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+            optim_c.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        avg = epoch_loss / max(n_batches, 1)
+        if avg < best_loss:
+            best_loss = avg
+            torch.save(critic.state_dict(), os.path.join(save_dir, save_name))
+            marker = " ★"
+        else:
+            marker = ""
+        if epoch % max(1, epochs // 20) == 0 or epoch <= 3 or marker:
+            print(f"  Epoch {epoch:>3d}/{epochs}  loss={avg:.5f}  best={best_loss:.5f}{marker}")
+
+    # Final save
+    torch.save(critic.state_dict(), os.path.join(save_dir, "critic_final.pt"))
+    print(f"\n  Critic pretraining done.  Best loss: {best_loss:.5f}")
+    print(f"  Saved to {os.path.join(save_dir, save_name)}")
+    print("=" * 60 + "\n")
+    return critic
+
+
+# ──────────────────────────────────────────────────────────────────────
 # CLI entry point
 # ──────────────────────────────────────────────────────────────────────
 
@@ -394,16 +592,23 @@ def main():
                         help="Path to a saved demos .pt file (skip collection)")
     parser.add_argument("--save_demos", type=str, default="demos/expert_demos.pt",
                         help="Where to save collected demos for reuse")
-    # Training
+    # Actor training
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--dispersive_lambda", type=float, default=0.1)
     parser.add_argument("--num_diffusion_steps", type=int, default=10)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
-    # Output
+    # Actor output
     parser.add_argument("--save_dir", type=str, default="models/actor/pretrained")
     parser.add_argument("--save_name", type=str, default="actor_pretrained.pt")
+    # Critic pretraining
+    parser.add_argument("--critic_epochs", type=int, default=30)
+    parser.add_argument("--critic_lr", type=float, default=5e-4)
+    parser.add_argument("--critic_save_dir", type=str, default="models/critic/pretrained")
+    parser.add_argument("--critic_save_name", type=str, default="critic_pretrained.pt")
+    parser.add_argument("--skip_critic", action="store_true",
+                        help="Skip critic pretraining (actor only)")
 
     args = parser.parse_args()
 
@@ -424,7 +629,7 @@ def main():
         torch.save(demos, args.save_demos)
         print(f"[Main] Demos saved to {args.save_demos}")
 
-    # ── Train ────────────────────────────────────────────────────────
+    # ── Train actor ──────────────────────────────────────────────────
     model = pretrain(
         demos=demos,
         epochs=args.epochs,
@@ -456,8 +661,25 @@ def main():
         mse = F.mse_loss(sampled, expert).item()
         print(f"  Action MSE: {mse:.5f}")
 
-    print("\n✓ Pre-training complete. Use the saved weights with D2PPO_agent via:")
-    print(f'    transfer=["{os.path.join(args.save_dir, args.save_name)}", None]')
+    # ── Train critic (reuse same demos) ──────────────────────────────
+    actor_weights_path = os.path.join(args.save_dir, args.save_name)
+    if not args.skip_critic:
+        actor_sd = torch.load(actor_weights_path, weights_only=False)
+        pretrain_critic(
+            demos=demos,
+            actor_state_dict=actor_sd,
+            epochs=args.critic_epochs,
+            batch_size=args.batch_size,
+            lr=args.critic_lr,
+            save_dir=args.critic_save_dir,
+            save_name=args.critic_save_name,
+        )
+        critic_path = os.path.join(args.critic_save_dir, args.critic_save_name)
+        print("\n✓ Pre-training complete. Use the saved weights with D2PPO_agent via:")
+        print(f'    transfer=["{actor_weights_path}", "{critic_path}"]')
+    else:
+        print("\n✓ Actor pre-training complete (critic skipped). Use with:")
+        print(f'    transfer=["{actor_weights_path}", None]')
 
 
 if __name__ == "__main__":

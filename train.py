@@ -38,13 +38,13 @@ EASY_MAPS = ["Hockenheim", "Monza", "Melbourne", "BrandsHatch"]
 MEDIUM_MAPS = ["Oschersleben", "Sakhir", "Sepang", "SaoPaulo", "Budapest", "Catalunya", "Silverstone"]
 HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Austin", "Nuerburgring", "Spa", "YasMarina", "Sochi",]
 TOTAL_TIMESTEPS = 12_000_000
-STEPS_PER_GENERATION = 1024
+STEPS_PER_GENERATION = 256
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = None # Generated later
-CURRENT_MAP = "Sepang" # Starting map, used for pretraining
+CURRENT_MAP = "Catalunya" # Starting map, used for pretraining
 PATIENCE = 200  # Early stopping patience
-GEN_PER_MAP = 1
+GEN_PER_MAP = 60
 
 def get_curriculum_map_pool(generation, selector=None):
     """Returns the appropriate map pool based on training progress."""
@@ -59,20 +59,23 @@ env = gym.make(
     fov=LIDAR_FOV,
     params=params_dict
 )
+# --- Reset Environment ---
+INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)    
+obs, timestep, _, _ = env.reset(poses=INITIAL_POSES)
+env.render(mode="human") # Render first to create the window/renderer
 
 # --- Agent Setup ---
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 
 ORIGINAL_WEIGHT = "models/actor/pretrained/actor_pretrained.pt"
-ACTOR_CHECKPOINT = f"models/actor/best/actor_gen_93.pt"
-CRITIC_CHECKPOINT = f"models/critic/best/critic_gen_93.pt"
+CRITIC_WEIGHT = None#"models/critic/pretrained/critic_pretrained.pt"
 
 agent = PPOAgent(
     num_agents=NUM_AGENTS_AI, 
     map_name=CURRENT_MAP,
     steps=STEPS_PER_GENERATION,
     params=params_dict,
-    transfer=[ORIGINAL_WEIGHT, None]
+    transfer=[ORIGINAL_WEIGHT, CRITIC_WEIGHT]
 )
 pp_driver = PurePursuit(
     map_name=CURRENT_MAP,
@@ -87,27 +90,38 @@ if hasattr(torch, 'compile'):
     agent.actor_network = torch.compile(agent.actor_network)
     agent.critic_network = torch.compile(agent.critic_network)
 
-STEPS_PER_GENERATION = int((agent.raceline_length / 7) * 201)  # Adjust steps based on raceline length and desired time per generation
-agent.update_buffer_size(STEPS_PER_GENERATION)
-print(f"Adjusted steps per generation to {STEPS_PER_GENERATION} based on raceline length.")
+# --- Critic Pretraining (live rollouts with real reward function) ---
+ALL_PRETRAIN_MAPS = EASY_MAPS + MEDIUM_MAPS
+agent.pretrain_critic(
+    env=env,
+    pp_driver=pp_driver,
+    num_agents_total=NUM_AGENTS,
+    maps=ALL_PRETRAIN_MAPS,
+    rollout_steps=STEPS_PER_GENERATION,
+    num_rollouts=len(ALL_PRETRAIN_MAPS),
+    epochs=15,
+    lr=5e-4,
+    batch_size=256,
+)
 
-# --- Reset Environment ---
-current_physics_time = 0.0
-
-INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)    
-obs, timestep, _, _ = env.reset(poses=INITIAL_POSES)
+# Restore starting map after pretraining
 agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
+env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
+wp_xy, wp_s, rl = agent._load_waypoints(CURRENT_MAP)
+agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = wp_xy, wp_s, rl
+pp_driver.update_map(CURRENT_MAP)
+obs, _, _, _ = env.reset(poses=INITIAL_POSES)
 
+# STEPS_PER_GENERATION = int(agent.raceline_length * 32)  # Adjust steps based on raceline length and desired time per generation
+# agent.update_buffer_size(STEPS_PER_GENERATION)
+# print(f"Adjusted steps per generation to {STEPS_PER_GENERATION} based on raceline length.")
 print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
-
-# Render first to create the window/renderer
-env.render(mode="human")
 
 best_avg_reward = -float('inf')
 patience = 0
 
 collision_timers = np.zeros(NUM_AGENTS, dtype=np.int32)
-COLLISION_RESET_THRESHOLD = 32
+COLLISION_RESET_THRESHOLD = 1
 
 for gen in range(num_generations):
     collisions = 0
@@ -251,11 +265,9 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
         agent.raceline_length = raceline_length
         agent.last_cumulative_distance = np.zeros(NUM_AGENTS_AI) 
         agent.last_wp_index = np.zeros(NUM_AGENTS_AI, dtype=np.int32)
-        
-        sps = 1 / (time.time() - timer)
-        sps = sps if sps > 1 else 100
-        STEPS_PER_GENERATION = int((raceline_length / 7) * sps)
-        agent.update_buffer_size(STEPS_PER_GENERATION)
+
+        # STEPS_PER_GENERATION = int(raceline_length * 32)
+        # agent.update_buffer_size(STEPS_PER_GENERATION)
         print(f"Adjusted steps per generation to {STEPS_PER_GENERATION} based on raceline length.")
 
         env.reset(poses=INITIAL_POSES)

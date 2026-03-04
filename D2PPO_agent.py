@@ -80,24 +80,24 @@ class D2PPOAgent:
         self.lidar_fov = 4.7
         self.image_size = 256
         self.minibatch_size = 128
-        self.epochs = 6               # Reduced for faster iteration
+        self.epochs = 10 
         self.params = params
         self.gfpp = GapFollowPurePursuit(
             map_name=map_name,
             wheelbase=params['lf'] + params['lr'],
             max_steering=params['s_max'],
             max_speed=8.0,
-            min_speed=1.5,
+            min_speed=1.0,
             num_beams=self.num_scan_beams,
             fov=self.lidar_fov,
         )
 
         # --- Advantage-weighted diffusion config ---
         self.num_diffusion_steps = num_diffusion_steps
-        self.awr_temperature = 5.0    # β for exp(A/β) advantage weighting
+        self.awr_temperature = 1.0    # β for exp(A/β) advantage weighting
         self.awr_max_weight = 20.0    # Clamp max weight for stability
         self.diff_reg_lambda = 1.0    # Unweighted diffusion MSE regulariser
-        self.dispersive_lambda = 0.1  # Dispersive loss weight (same as pretrain default)
+        self.dispersive_lambda = 0.1  # Dispersive loss weight (reduced for Stage-2 RL)
         self.dispersive_temperature = 0.5
 
         # --- Waypoints for Raceline Reward ---
@@ -109,7 +109,6 @@ class D2PPOAgent:
         self.last_checkpoint = np.zeros(self.num_agents, dtype=int)
 
         # --- Reward Scalars ---
-        self.PROGRESS_REWARD_SCALAR = 48.0
         self.LAP_REWARD = 80.0
         self.CHECKPOINT_REWARD = self.LAP_REWARD * 0.1
         self.COLLISION_PENALTY = -4.0
@@ -120,7 +119,7 @@ class D2PPOAgent:
 
         # --- Networks ---
         actor_encoder = self._transfer_vision(transfer[0])
-        critic_encoder = self._transfer_vision(transfer[1])
+        critic_encoder = self._transfer_vision(transfer[0])
 
         # Diffusion Policy Actor
         self.actor_network = DiffusionLSTM(
@@ -136,17 +135,23 @@ class D2PPOAgent:
             proj_hidden=384,
             lstm_hidden_size=128,
             lstm_num_layers=2,
-            memory_length=64,            # was 350
-            memory_stride=4              # was 20
+            memory_length=64,
+            memory_stride=100
         ).to(self.device)
 
         # Register dispersive hooks on last denoiser block (same as pretraining)
         self.actor_network.denoise_net.register_dispersive_hooks("late")
 
-        # Critic (same as PPOAgent – not diffusion-based)
+        # Critic with LSTM temporal backbone (mirrors actor architecture)
         self.critic_network = CriticNetwork(
             state_dim=self.state_dim,
             encoder=critic_encoder,
+            lstm_hidden_size=64,
+            lstm_num_layers=2,
+            memory_length=48,
+            memory_stride=100,
+            odom_expand=64,
+            proj_hidden=256,
         ).to(self.device)
 
         self.actor_network = self._transfer_weights(transfer[0], self.actor_network)
@@ -174,7 +179,7 @@ class D2PPOAgent:
 
         self.diagnostic_keys = [
             "loss_actor", "loss_critic", "loss_diffusion",
-            "loss_dispersive", "adv_weight_mean", "collisions", "reward", "avg_speed"
+            "loss_dispersive", "adv_weight_std", "collisions", "reward", "avg_speed"
         ]
         self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
         self.generation_counter = 0
@@ -189,6 +194,15 @@ class D2PPOAgent:
             self.num_agents, self.device, transpose=True
         )
 
+        # --- Critic LSTM temporal state ---
+        self.critic_buffer = deque(
+            [self.critic_network.create_observation_buffer(self.num_agents, self.device)],
+            maxlen=2,
+        )
+        self.critic_hidden = self.critic_network.get_init_hidden(
+            self.num_agents, self.device, transpose=True
+        )
+
         # For computing acceleration from consecutive velocity observations
         # (the sim's linear_accel_x is always 0)
         self._prev_vels_x = np.zeros(self.num_agents)
@@ -198,8 +212,196 @@ class D2PPOAgent:
         self.buffer = TensorDictReplayBuffer(storage=ListStorage(max_size=new_size))
         print(f"Updated replay buffer size to {new_size}")
 
+    # ------------------------------------------------------------------
+    # Critic pretraining  (run once before RL loop)
+    # ------------------------------------------------------------------
+    def pretrain_critic(self, env, pp_driver, num_agents_total, maps,
+                        rollout_steps=512, num_rollouts=3, epochs=10,
+                        lr=5e-4, batch_size=256):
+        """Pre-train the critic on MC returns collected by the pretrained actor.
+
+        Runs the frozen actor for *num_rollouts* episodes on a diverse set of
+        *maps*, computes discounted Monte-Carlo returns, then trains the
+        critic's LSTM + value head via supervised MSE regression.  The vision
+        encoder is frozen (already pretrained) so only the temporal and value
+        layers are fitted.
+
+        Should be called **once** right after agent construction, before the
+        main RL loop begins.
+        """
+        from utils.utils import generate_start_poses, get_map_dir
+        from baselines.pure_pursuit import PurePursuit
+
+        print("\n" + "=" * 60)
+        print("  CRITIC PRE-TRAINING")
+        print("=" * 60)
+
+        # Freeze the vision encoder — only train LSTM + projection + value head
+        for p in self.critic_network.conv_layers.parameters():
+            p.requires_grad = False
+
+        pretrain_optim = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.critic_network.parameters()),
+            lr=lr, weight_decay=0.01,
+        )
+
+        all_scans = []
+        all_states = []
+        all_returns = []
+
+        self.actor_network.eval()
+        self.critic_network.train()
+
+        for rollout_idx in range(num_rollouts):
+            # Pick a map (cycle through the list)
+            map_name = maps[rollout_idx % len(maps)]
+            print(f"  Rollout {rollout_idx + 1}/{num_rollouts} on {map_name}")
+
+            # Reconfigure env and waypoints
+            env.update_map(get_map_dir(map_name) + f"/{map_name}_map", ".png")
+            wp_xy, wp_s, rl = self._load_waypoints(map_name)
+            self.waypoints_xy, self.waypoints_s, self.raceline_length = wp_xy, wp_s, rl
+            self.last_cumulative_distance[:] = 0
+            self.last_wp_index[:] = 0
+            self.last_checkpoint[:] = 0
+            self._prev_lap_counts[:] = 0
+
+            pp_driver.update_map(map_name)
+
+            poses = generate_start_poses(map_name, num_agents_total)
+            obs, _, _, _ = env.reset(poses=poses)
+            self.reset_progress_trackers(initial_poses_xy=poses[:, :2])
+            self.reset_buffers()
+            self._prev_vels_x[:] = 0
+
+            collision_timers = np.zeros(num_agents_total, dtype=np.int32)
+            rollout_scans = []
+            rollout_states = []
+            rollout_rewards = []
+
+            for step in range(rollout_steps):
+                scan_t, state_t = self._obs_to_tensors(obs)
+                with torch.no_grad():
+                    action, _, _ = self.get_action_and_value(scan_t, state_t, store=True)
+
+                action_np = action.cpu().numpy()
+                if action_np.shape[0] < num_agents_total:
+                    pp_act = pp_driver.get_actions_batch(obs).astype(np.float32)
+                    action_np = np.vstack((action_np, pp_act[action_np.shape[0]:]))
+
+                next_obs, _, _, _ = env.step(action_np)
+                rew_t, _ = self.calculate_reward(next_obs)
+
+                # Handle stuck agents
+                cols = np.array(next_obs['collisions'][:num_agents_total])
+                vels = np.array(next_obs['linear_vels_x'][:num_agents_total])
+                collision_timers[(cols == 1) | ((vels < 0.1) & (vels > -0.1))] += 1
+                collision_timers[cols == 0] = 0
+                stuck = np.where(collision_timers >= 32)[0]
+                if len(stuck) > 0:
+                    cur_poses = np.stack([next_obs['poses_x'], next_obs['poses_y'],
+                                          next_obs['poses_theta']], axis=1)
+                    new_poses = generate_start_poses(map_name, num_agents_total, agent_poses=cur_poses)
+                    next_obs, _, _, _ = env.reset(poses=new_poses, agent_idxs=stuck)
+                    self.reset_buffers(stuck)
+                    self.reset_progress_trackers(initial_poses_xy=new_poses[:, :2], agent_idxs=stuck)
+                    collision_timers[stuck] = 0
+
+                # Store per-agent data (scans/states only for AI agents)
+                rollout_scans.append(scan_t[:self.num_agents].cpu())
+                rollout_states.append(state_t[:self.num_agents].cpu())
+                rollout_rewards.append(rew_t[:self.num_agents].cpu())  # (A, 1)
+
+                obs = next_obs
+                if (step + 1) % 100 == 0:
+                    print(f"    step {step + 1}/{rollout_steps}", end='\r')
+
+            print()
+
+            # Compute discounted MC returns  (reverse cumsum)
+            T = len(rollout_rewards)
+            rewards_arr = torch.stack(rollout_rewards).squeeze(-1)  # (T, A)
+            # Per-generation normalisation
+            r_std = rewards_arr.std().clamp(min=1e-4)
+            rewards_arr = rewards_arr / r_std
+
+            returns = torch.zeros_like(rewards_arr)
+            G = torch.zeros(self.num_agents)
+            for t in reversed(range(T)):
+                G = rewards_arr[t] + self.gamma * G
+                returns[t] = G
+
+            # Flatten time × agents → samples
+            scans_flat = torch.cat(rollout_scans, dim=0)     # (T*A, 1, beams)
+            states_flat = torch.cat(rollout_states, dim=0)    # (T*A, state_dim)
+            returns_flat = returns.reshape(-1)                # (T*A,)
+
+            all_scans.append(scans_flat)
+            all_states.append(states_flat)
+            all_returns.append(returns_flat)
+
+        # --- Combine all rollout data ---
+        X_scans = torch.cat(all_scans, dim=0).to(self.device)
+        X_states = torch.cat(all_states, dim=0).to(self.device)
+        Y_returns = torch.cat(all_returns, dim=0).to(self.device)
+
+        N = X_scans.shape[0]
+        print(f"  Collected {N} samples for critic pretraining."
+              f"  Returns: mean={Y_returns.mean():.2f}, std={Y_returns.std():.2f}")
+
+        # --- Supervised training (no LSTM context — feedforward on single frames) ---
+        # This is intentional: we can't replay temporal context from stored
+        # transitions. Instead we train the projection + value head to give a
+        # reasonable baseline prediction from single observations, then the
+        # LSTM will refine this during RL training with live temporal state.
+        self.critic_network.train()  # ensure train mode (get_action_and_value sets eval)
+        best_loss = float('inf')
+        for epoch in range(1, epochs + 1):
+            perm = torch.randperm(N, device=self.device)
+            epoch_loss = 0.0
+            n_batches = 0
+            for i in range(0, N, batch_size):
+                idx = perm[i:i + batch_size]
+                s = X_scans[idx]
+                st = X_states[idx]
+                y = Y_returns[idx]
+
+                # Forward: encode single frame (no obs_buffer / hidden)
+                feat, _, _, _ = self.critic_network.encode_observation(s, st, obs_buffer=None)
+                pred = self.critic_network.fc_layers(feat).squeeze(-1)
+                loss = F.smooth_l1_loss(pred, y)
+
+                pretrain_optim.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.critic_network.parameters(), 1.0)
+                pretrain_optim.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            avg_loss = epoch_loss / max(n_batches, 1)
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+            print(f"  Epoch {epoch}/{epochs}  loss={avg_loss:.4f}  best={best_loss:.4f}")
+
+        # Unfreeze vision encoder for RL fine-tuning
+        for p in self.critic_network.conv_layers.parameters():
+            p.requires_grad = True
+
+        # Re-create the optimizer so it includes all params with fresh state
+        self.critic_optimizer = torch.optim.AdamW(
+            self.critic_network.parameters(), lr=self.lr_critic, weight_decay=0.01,
+        )
+        self.critic_scaler = torch.amp.GradScaler("cuda")
+
+        # Reset temporal state for clean start
+        self.reset_buffers()
+        self._prev_vels_x[:] = 0
+
+        print(f"  Critic pretraining complete.  Best loss: {best_loss:.4f}")
+        print("=" * 60 + "\n")
+
     def reset_buffers(self, agent_indices=None):
-        """Reset LSTM hidden states and observation buffers."""
+        """Reset LSTM hidden states and observation buffers for both actor and critic."""
         if agent_indices is None:
             # Full reset for all agents
             self.actor_buffer = deque(
@@ -209,6 +411,13 @@ class D2PPOAgent:
             self.actor_hidden = self.actor_network.get_init_hidden(
                 self.num_agents, self.device, transpose=True
             )
+            self.critic_buffer = deque(
+                [self.critic_network.create_observation_buffer(self.num_agents, self.device)],
+                maxlen=2,
+            )
+            self.critic_hidden = self.critic_network.get_init_hidden(
+                self.num_agents, self.device, transpose=True
+            )
             self._prev_vels_x = np.zeros(self.num_agents)
         else:
             agent_indices = agent_indices[agent_indices < self.num_agents]
@@ -216,12 +425,20 @@ class D2PPOAgent:
             if self.actor_buffer[-1] is not None:
                 for idx in agent_indices:
                     self.actor_buffer[-1][idx] = 0.0
-            # Zero out hidden states for specific agents
             h, c = self.actor_hidden
             for idx in agent_indices:
                 h[idx] = 0.0
                 c[idx] = 0.0
             self.actor_hidden = (h, c)
+            # Critic per-agent reset
+            if self.critic_buffer[-1] is not None:
+                for idx in agent_indices:
+                    self.critic_buffer[-1][idx] = 0.0
+            ch, cc = self.critic_hidden
+            for idx in agent_indices:
+                ch[idx] = 0.0
+                cc[idx] = 0.0
+            self.critic_hidden = (ch, cc)
             self._prev_vels_x[agent_indices] = 0.0
     
     def get_action_and_value(self, scan_tensor, state_tensor, deterministic=False, store=True):
@@ -239,11 +456,22 @@ class D2PPOAgent:
         self.critic_network.eval()
 
         with torch.no_grad():
-            # Value estimate (critic is feedforward — no temporal state)
-            value = self.critic_network(
+            # Value estimate (critic with LSTM temporal state)
+            critic_features, new_critic_buf, new_ch, new_cc = self.critic_network.encode_observation(
                 scan_tensor[: self.num_agents],
                 state_tensor[: self.num_agents],
+                self.critic_buffer[-1],
+                self.critic_hidden[0],
+                self.critic_hidden[1],
             )
+            value = self.critic_network.fc_layers(critic_features)
+
+            # Always advance critic temporal state when we have valid obs
+            self.critic_buffer.append(new_critic_buf)
+            self.critic_hidden = (new_ch, new_cc)
+
+            # Cache critic features for store_transition
+            self._last_critic_features = critic_features.float()
 
             if not store:
                 # Bootstrapping: only value needed — skip diffusion entirely
@@ -284,7 +512,7 @@ class D2PPOAgent:
             # train-test temporal mismatch).
             self._last_obs_features = obs_features.float()
 
-        return action, log_prob, value
+        return action, log_prob, value.squeeze(-1) if value.ndim > 1 else value
 
 
     def store_transition(self, obs, next, action, log_prob, reward, done, value):
@@ -301,6 +529,7 @@ class D2PPOAgent:
                 "observation_scan": obs[0],
                 "observation_state": obs[1],
                 "obs_features": self._last_obs_features,
+                "critic_features": self._last_critic_features,
                 "action": action,
                 "action_log_prob": log_prob,
                 "state_value": value,
@@ -327,39 +556,28 @@ class D2PPOAgent:
         agent_collisions = collisions == 2
         rewards = np.zeros(self.num_agents)
 
-        # --- PROGRESS REWARD ---
-        for i in range(self.num_agents):
-            projected_s, new_wp_idx = self._project_to_raceline(
-                positions[i],
-                self.last_wp_index[i],
-                lookahead=50,
-            )
+        # --- Track position for checkpoints / laps (no progress reward) ---
+        # for i in range(self.num_agents):
+        #     projected_s, new_wp_idx = self._project_to_raceline(
+        #         positions[i],
+        #         self.last_wp_index[i],
+        #         lookahead=50,
+        #     )
 
-            # Guard against NaN positions (e.g. from NaN actions)
-            if np.isnan(projected_s):
-                projected_s = self.last_cumulative_distance[i]
-                new_wp_idx = self.last_wp_index[i]
+        #     # Guard against NaN positions (e.g. from NaN actions)
+        #     if np.isnan(projected_s):
+        #         projected_s = self.last_cumulative_distance[i]
+        #         new_wp_idx = self.last_wp_index[i]
 
-            progress = projected_s - self.last_cumulative_distance[i]
-            if progress < -self.raceline_length / 2:
-                progress += self.raceline_length   # crossed start/finish
-            elif progress > self.raceline_length / 2:
-                progress -= self.raceline_length   # went backwards
+        #     # --- Checkpoint reward (divide track into NUM_CHECKPOINTS segments) ---
+        #     segment_len = self.raceline_length / self.NUM_CHECKPOINTS
+        #     new_ckpt = int(projected_s / segment_len) % self.NUM_CHECKPOINTS
+        #     if new_ckpt != self.last_checkpoint[i]:
+        #         rewards[i] += self.CHECKPOINT_REWARD
+        #         self.last_checkpoint[i] = new_ckpt
 
-            if progress > 0:
-                rewards[i] += progress * self.PROGRESS_REWARD_SCALAR
-            else:
-                rewards[i] += progress * self.PROGRESS_REWARD_SCALAR * 2.0  # penalise reversing harder
-
-            # --- Checkpoint reward (divide track into NUM_CHECKPOINTS segments) ---
-            segment_len = self.raceline_length / self.NUM_CHECKPOINTS
-            new_ckpt = int(projected_s / segment_len) % self.NUM_CHECKPOINTS
-            if new_ckpt != self.last_checkpoint[i]:
-                rewards[i] += self.CHECKPOINT_REWARD
-                self.last_checkpoint[i] = new_ckpt
-
-            self.last_cumulative_distance[i] = projected_s
-            self.last_wp_index[i] = new_wp_idx
+        #     self.last_cumulative_distance[i] = projected_s
+        #     self.last_wp_index[i] = new_wp_idx
 
         # --- SPEED BONUS vs GFPP reference ---
         target_speed = self.gfpp.get_actions_batch(next_obs)
@@ -436,8 +654,10 @@ class D2PPOAgent:
         obs_scan_all = data["observation_scan"]
         obs_state_all = data["observation_state"]
         obs_features_all = data["obs_features"]  # Cached from rollout (with LSTM context)
+        critic_features_all = data["critic_features"]  # Cached critic LSTM features
         actions_all = data["action"]
-        advantages_all = data["advantage"]
+        raw_advantages_all = data["raw_advantage"]  # Un-normalised for AWR weights
+        advantages_all = data["advantage"]           # Normalised for diagnostics
         value_targets_all = data["value_target"]
         old_values_all = data["state_value"]
 
@@ -464,6 +684,7 @@ class D2PPOAgent:
             epoch_actor_loss = 0.0
             epoch_critic_loss = 0.0
             epoch_diff_loss = 0.0
+            epoch_disp_loss = 0.0
             num_updates = 0
 
             indices = torch.randperm(num_timesteps)
@@ -475,11 +696,13 @@ class D2PPOAgent:
                 obs_scan = obs_scan_all[mb_idx]
                 obs_state = obs_state_all[mb_idx]
                 obs_features = obs_features_all[mb_idx]
+                critic_features = critic_features_all[mb_idx]
                 actions = actions_all[mb_idx]
+                raw_advantages = raw_advantages_all[mb_idx]
                 advantages = advantages_all[mb_idx]
                 value_targets = value_targets_all[mb_idx]
                 old_values = old_values_all[mb_idx]
-                speeds = np.array(obs_state[:, 1], dtype=np.float32)
+                speeds = np.array(obs_state[:, :, 0].contiguous().cpu(), dtype=np.float32)
 
                 # Flatten agents dimension if present: [T, A, ...] → [T*A, ...]
                 if obs_scan.ndim == 4:  # [T, A, 1, beams]
@@ -487,7 +710,9 @@ class D2PPOAgent:
                     obs_scan = obs_scan.reshape(T * A, *obs_scan.shape[2:])
                     obs_state = obs_state.reshape(T * A, *obs_state.shape[2:])
                     obs_features = obs_features.reshape(T * A, *obs_features.shape[2:])
+                    critic_features = critic_features.reshape(T * A, *critic_features.shape[2:])
                     actions = actions.reshape(T * A, *actions.shape[2:])
+                    raw_advantages = raw_advantages.reshape(T * A)
                     advantages = advantages.reshape(T * A)
                     value_targets = value_targets.reshape(T * A)
                     old_values = old_values.reshape(T * A)
@@ -496,7 +721,9 @@ class D2PPOAgent:
                     obs_scan = obs_scan.reshape(T * A, *obs_scan.shape[2:]) if obs_scan.shape[0] == T else obs_scan
                     obs_state = obs_state.reshape(T * A, -1) if obs_state.shape[0] == T else obs_state
                     obs_features = obs_features.reshape(T * A, -1)
+                    critic_features = critic_features.reshape(T * A, -1)
                     actions = actions.reshape(T * A, -1)
+                    raw_advantages = raw_advantages.reshape(T * A)
                     advantages = advantages.reshape(T * A)
                     value_targets = value_targets.reshape(T * A)
                     old_values = old_values.reshape(T * A)
@@ -525,8 +752,13 @@ class D2PPOAgent:
                 # Per-sample noise prediction MSE: (B,)
                 per_sample_mse = ((pred_noise - noise) ** 2).sum(dim=-1)
 
-                # Advantage weights: exp(A / β), normalised
-                adv = advantages.detach()
+                # Advantage weights: exp(A / β) using RAW (un-normalised) advantages
+                # Normalise to zero-mean unit-std BEFORE exp() so the temperature
+                # parameter actually controls the sharpness rather than having
+                # γ=0.999 GAE advantages (magnitude 50-200) immediately saturate
+                # the exp() at the clamp ceiling.
+                adv = raw_advantages.detach()
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
                 weights = torch.exp(adv / self.awr_temperature)
                 weights = weights.clamp(max=self.awr_max_weight)
                 weights = weights / (weights.mean() + 1e-8)
@@ -563,7 +795,8 @@ class D2PPOAgent:
                 )
 
                 # Critic: Huber loss with PPO-style value clipping
-                predicted_values = self.critic_network(obs_scan, obs_state)
+                # Use cached critic features (pre-computed with LSTM context during rollout)
+                predicted_values = self.critic_network.forward_from_features(critic_features)
                 if predicted_values.ndim > 1:
                     predicted_values = predicted_values.squeeze(-1)
 
@@ -599,21 +832,23 @@ class D2PPOAgent:
                 epoch_actor_loss += actor_loss.item()
                 epoch_critic_loss += critic_loss.item()
                 epoch_diff_loss += diff_reg.item()
+                epoch_disp_loss += disp_loss.item()
                 num_updates += 1
 
                 current_gen_diagnostics["loss_actor"].append(actor_loss.item())
                 current_gen_diagnostics["loss_critic"].append(critic_loss.item())
                 current_gen_diagnostics["loss_diffusion"].append(diff_reg.item())
                 current_gen_diagnostics["loss_dispersive"].append(disp_loss.item())
-                current_gen_diagnostics["adv_weight_mean"].append(weights.mean().item())
-                current_gen_diagnostics["avg_speed"].append(speeds[mb_idx].mean().item())
+                current_gen_diagnostics["adv_weight_std"].append(weights.std().item())
+                current_gen_diagnostics["avg_speed"].append(float(speeds.mean()) if hasattr(speeds, 'mean') else float(speeds))
 
             if num_updates > 0:
                 print(
                     f"  Epoch {epoch+1}/{self.epochs}: "
                     f"Actor={epoch_actor_loss/num_updates:.4f}, "
                     f"Critic={epoch_critic_loss/num_updates:.4f}, "
-                    f"Diff={epoch_diff_loss/num_updates:.4f}"
+                    f"Diff={epoch_diff_loss/num_updates:.4f}, "
+                    f"Disp={epoch_disp_loss/num_updates:.4f}, "
                 )
 
             torch.cuda.empty_cache()
@@ -701,6 +936,12 @@ class D2PPOAgent:
             values = values.unsqueeze(-1)
             next_values = next_values.unsqueeze(-1)
 
+        # --- Per-generation reward normalisation ---
+        # Normalise by this generation's reward std only (avoids cross-map
+        # contamination from running statistics when maps switch frequently).
+        reward_std = rewards.std().clamp(min=1e-4)
+        rewards = rewards / reward_std
+
         timesteps = rewards.shape[0]
         num_agents = rewards.shape[1] if rewards.ndim == 2 else 1
 
@@ -713,6 +954,11 @@ class D2PPOAgent:
             advantages[t] = gae
 
         returns = advantages + values
+
+        # Store raw advantages for AWR weighting (before normalisation)
+        data.set("raw_advantage", advantages.clone())
+
+        # Normalised advantages (for diagnostics / logging)
         adv_flat = advantages.flatten()
         advantages = (advantages - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
@@ -793,17 +1039,32 @@ class D2PPOAgent:
         new_encoder = VisionEncoder(self.num_scan_beams)
         if path is None:
             return new_encoder.to(self.device)
+        if not os.path.exists(path):
+            print(f"Warning: vision checkpoint '{path}' not found — using random init.")
+            return new_encoder.to(self.device)
         checkpoint = torch.load(path, weights_only=False)
-        prefix = "conv_layers."
+        # Try multiple prefixes: CriticNetwork uses conv_layers.*,
+        # DiffusionLSTM uses vision_encoder.*, legacy uses 0.module.conv_layers.*
+        prefixes = ["conv_layers.", "vision_encoder.", "0.module.conv_layers.", "0.module.vision_encoder."]
         encoder_sd = {}
         for k, v in checkpoint.items():
-            if k.startswith(prefix):
-                encoder_sd[k[len(prefix):]] = v
-            elif k.startswith("0.module." + prefix):
-                encoder_sd[k[len("0.module." + prefix):]] = v
+            if not isinstance(v, torch.Tensor):
+                continue
+            for prefix in prefixes:
+                if k.startswith(prefix):
+                    encoder_sd[k[len(prefix):]] = v
+                    break
         if encoder_sd:
-            new_encoder.load_state_dict(encoder_sd)
-            print("Loaded pre-trained vision encoder weights.")
+            # Filter to only matching shapes
+            ref_sd = new_encoder.state_dict()
+            filtered = {k: v for k, v in encoder_sd.items() if k in ref_sd and ref_sd[k].shape == v.shape}
+            if filtered:
+                new_encoder.load_state_dict(filtered, strict=False)
+                print(f"Loaded {len(filtered)}/{len(ref_sd)} pre-trained vision encoder weights from '{path}'.")
+            else:
+                print(f"No compatible vision encoder weights found in '{path}'.")
+        else:
+            print(f"No vision encoder keys found in '{path}'.")
         return new_encoder.to(self.device)
 
     def _load_waypoints(self, map_name):
