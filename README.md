@@ -79,23 +79,14 @@ The critic shares the same LSTM encoder and predicts a scalar value estimate for
 
 ## Installation
 
-### 1. Clone the F1TENTH gym and install it
-
-```bash
-git clone https://github.com/f1tenth/f1tenth_gym
-cd f1tenth_gym
-pip install -e .
-cd ..
-```
-
-### 2. Clone this repository
+### 1. Clone this repository
 
 ```bash
 git clone https://github.com/adsarver/TR-D2PPO
 cd TR-D2PPO
 ```
 
-### 3. Install Python dependencies
+### 2. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
