@@ -73,7 +73,7 @@ Input per step (50 Hz):
            speed   ∈ [0, 20] m/s]
 ```
 
-The critic shares the same LSTM encoder and predicts a scalar value estimate for each observation.
+The critic shares the same LSTM / Mamba2 encoder and predicts a scalar value estimate for each observation.
 
 ---
 
@@ -142,7 +142,7 @@ Loads a trained checkpoint and evaluates it on held-out tracks, collecting lap t
 ```
 1. Behavioral Cloning Pretraining  (weight_initializer.py)
    ├─ Collect GapFollowPurePursuit demos on diverse maps
-   ├─ Supervise DiffusionLSTM with:
+   ├─ Supervise DiffusionLSTM/Mamba2 with:
    │     L = L_diffusion + λ · L_dispersive
    └─ Save pretrained actor weights
 
@@ -190,9 +190,9 @@ TR-D2PPO/
 │   ├── DiffusionLSTM.py      # Main policy: DDPM denoiser + LSTM backbone
 │   ├── DiffusionMamba2.py    # Alternative: DDPM denoiser + Mamba2 backbone
 │   ├── CriticNetworks.py     # Value network (LSTM / Mamba2 encoder)
-│   ├── HybridLSTM.py         # Classic LSTM + Gaussian policy (baseline)
-│   ├── Mamba2Racer.py        # Mamba2 policy variant
-│   ├── RLMamba2Racer.py      # Mamba2 RL policy head
+│   ├── HybridLSTM.py         # Hybrid training LSTM + Gaussian policy (baseline)
+│   ├── Mamba2Racer.py        # Mamba2 variant, no diffusion
+│   ├── RLMamba2Racer.py      # Mamba2 RL policy head, no diffusion
 │   └── AuxModels.py          # VisionEncoder, ResidualBlocks, SinusoidalPosEmb
 │
 ├── utils/
