@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.AuxModels import VisionEncoder
+from mamba_ssm.modules.mamba2_simple import Mamba2Simple
 
 class CriticNetwork(nn.Module):
     """
@@ -79,9 +80,9 @@ class CriticNetwork(nn.Module):
         # Value head (maps LSTM output to scalar state value)
         self.fc_layers = nn.Sequential(
             nn.Linear(lstm_hidden_size, lstm_hidden_size),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(lstm_hidden_size, 32),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(32, 1)
         )
     
@@ -199,3 +200,137 @@ class CriticNetwork(nn.Module):
         )
         value = self.fc_layers(critic_features)
         return value, obs_buffer, hidden_h, hidden_c
+
+
+class Mamba2CriticNetwork(nn.Module):
+    """
+    Mamba2-enhanced value network.
+    Mirrors the actor's temporal backbone (DiffusionMamba2) so the critic
+    has comparable representational capacity for long-horizon returns.
+    """
+    def __init__(
+        self, 
+        state_dim=4, 
+        encoder=None,
+        d_model=256,
+        d_state=16,
+        d_conv=4,
+        d_head=16,
+        expand=2,
+        memory_length=48,
+        odom_expand=64,
+        num_scan_beams=1080,
+    ):
+        super(Mamba2CriticNetwork, self).__init__()
+        
+        # Vision encoder (CNN for LIDAR)
+        self.conv_layers = encoder if encoder is not None else VisionEncoder(num_scan_beams=num_scan_beams)
+        conv_output_size = self.conv_layers.output_size
+        
+        # Memory configuration
+        self.memory_length = memory_length
+        self.d_model = d_model
+        
+        # Odom handling — baked-in normalisation ranges
+        default_ranges = [
+            [-5.0, 20.0],   # linear_vel_x
+            [-5.0,  5.0],   # linear_vel_y
+            [-15.0, 15.0],  # ang_vel_z
+            [-10.0, 10.0],  # linear_accel_x
+        ]
+        state_lo = torch.tensor([r[0] for r in default_ranges[:state_dim]], dtype=torch.float32)
+        state_hi = torch.tensor([r[1] for r in default_ranges[:state_dim]], dtype=torch.float32)
+        self.register_buffer("state_lo", state_lo)
+        self.register_buffer("state_hi", state_hi)
+
+        self.odom_expand_layer = nn.Linear(state_dim, odom_expand)
+        
+        # Feature projection (CNN+odom → d_model)
+        feature_input_size = conv_output_size + odom_expand
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_input_size, 768),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(768, d_model),
+            nn.ReLU(),
+        )
+
+        # Mamba2 temporal backbone
+        self.pre_mamba_norm = nn.LayerNorm(d_model)
+        self.mamba = Mamba2Simple(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            headdim=d_head,
+            expand=expand,
+        )
+        self.norm_layer = nn.LayerNorm(d_model)
+        
+        # Value head
+        self.fc_layers = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+    
+    def create_observation_buffer(self, batch_size, device):
+        """Create a buffer to store recent observations for Mamba input."""
+        return torch.zeros(batch_size, self.memory_length, self.d_model, device=device)
+
+    def encode_observation(self, scan_tensor, state_tensor, obs_buffer):
+        """
+        Encode raw observations through CNN + Mamba2 temporal backbone.
+        """
+        batch_size = scan_tensor.shape[0]
+        device = scan_tensor.device
+
+        if obs_buffer is None:
+            obs_buffer = self.create_observation_buffer(batch_size, device)
+        if obs_buffer.device != device:
+            obs_buffer = obs_buffer.to(device)
+
+        # Scan normalisation
+        scan_norm = scan_tensor.clamp(0.0, 10.0) / 10.0
+
+        # CNN features
+        vision_features = self.conv_layers(scan_norm)
+
+        # State normalisation
+        state_norm = 2.0 * (state_tensor - self.state_lo) / (self.state_hi - self.state_lo + 1e-8) - 1.0
+        state_norm = state_norm.clamp(-1.0, 1.0)
+        state_feat = self.odom_expand_layer(state_norm)
+
+        combined = torch.cat([vision_features, state_feat], dim=-1)
+        projected = self.feature_projection(combined)
+
+        # Rolling buffer update
+        obs_buffer = torch.cat([
+            obs_buffer[:, 1:, :],
+            projected.unsqueeze(1),
+        ], dim=1)
+
+        # Mamba2 temporal pass
+        obs_normed = self.pre_mamba_norm(obs_buffer)
+        mamba_out = self.mamba(obs_normed)
+        critic_features = self.norm_layer(mamba_out[:, -1, :])
+
+        return critic_features, obs_buffer
+
+    def forward_from_features(self, critic_features):
+        """
+        Value prediction from pre-computed (cached) Mamba features.
+        Used during ``learn()`` to avoid re-encoding.
+        """
+        return self.fc_layers(critic_features)
+
+    def forward(self, scan_tensor, state_tensor, obs_buffer=None):
+        """
+        Full forward pass: encode observations then predict value.
+        """
+        critic_features, obs_buffer = self.encode_observation(
+            scan_tensor, state_tensor, obs_buffer
+        )
+        value = self.fc_layers(critic_features)
+        return value, obs_buffer

@@ -44,6 +44,7 @@ class DiffusionMamba2(nn.Module):
         action_dim=2,
         encoder=None,
         num_diffusion_steps=50,
+        inference_steps=0,          # if >0, use DDIM sampling with this many steps
         obs_feature_dim=256,           # matches d_model for Mamba2
         time_emb_dim=32,
         hidden_dims=(768, 768, 768),
@@ -56,13 +57,23 @@ class DiffusionMamba2(nn.Module):
         expand=2,
         memory_length=48,
         odom_expand=64,
+        # Action normalisation range  (raw env units → [-1, 1])
+        action_low=(-0.34, 0.0),      # (min_steering, min_speed)
+        action_high=(0.34, 20.0),     # (max_steering, max_speed)
     ):
         super().__init__()
         self.action_dim = action_dim
         self.num_diffusion_steps = num_diffusion_steps
+        self.inference_steps = inference_steps  # 0 → fall back to num_diffusion_steps
         self.obs_feature_dim = obs_feature_dim
         self.d_model = d_model
         self.memory_length = memory_length
+
+        # --- Action normalisation  (raw ↔ [-1, 1]) ---
+        act_lo = torch.tensor(action_low,  dtype=torch.float32)
+        act_hi = torch.tensor(action_high, dtype=torch.float32)
+        self.register_buffer("action_lo", act_lo)
+        self.register_buffer("action_hi", act_hi)
 
         # --- Vision encoder (1-D CNN for LiDAR) ---
         if encoder is None:
@@ -199,6 +210,15 @@ class DiffusionMamba2(nn.Module):
     # Forward / reverse diffusion helpers
     # ------------------------------------------------------------------
 
+    def normalize_action(self, action):
+        """Map raw action from [action_lo, action_hi] → [-1, 1]."""
+        return 2.0 * (action - self.action_lo) / (self.action_hi - self.action_lo + 1e-8) - 1.0
+
+    def denormalize_action(self, action_norm):
+        """Map normalised action from [-1, 1] → [action_lo, action_hi], clamped."""
+        raw = (action_norm + 1.0) * 0.5 * (self.action_hi - self.action_lo) + self.action_lo
+        return raw.clamp(self.action_lo.unsqueeze(0), self.action_hi.unsqueeze(0))
+
     def q_sample(self, x_start, t, noise=None):
         """Forward diffusion: q(a^k | a^0)."""
         if noise is None:
@@ -213,10 +233,20 @@ class DiffusionMamba2(nn.Module):
     @torch.no_grad()
     def p_mean_variance(self, x_t, obs_features, t):
         pred_noise = self.predict_noise(x_t, obs_features, t)
-        sqrt_recip = extract(self.sqrt_recip_alphas, t, x_t.shape)
-        beta_t = extract(self.betas, t, x_t.shape)
-        sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
-        mean = sqrt_recip * (x_t - beta_t / sqrt_one_minus * pred_noise)
+
+        # Predict x_0 from the noise prediction and clamp to [-1, 1]
+        # This prevents cascading amplification of prediction errors through
+        # the reverse chain (critical with aggressive cosine schedule / few steps).
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+        x_0_pred = (x_t - sqrt_one_minus_t * pred_noise) / sqrt_alphas_cumprod_t.clamp(min=1e-8)
+        x_0_pred = x_0_pred.clamp(-1.0, 1.0)
+
+        # Re-derive posterior mean from the clamped x_0 prediction
+        coef1 = extract(self.posterior_mean_coef1, t, x_t.shape)
+        coef2 = extract(self.posterior_mean_coef2, t, x_t.shape)
+        mean = coef1 * x_0_pred + coef2 * x_t
+
         var = extract(self.posterior_variance, t, x_t.shape)
         log_var = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return mean, var, log_var
@@ -228,26 +258,86 @@ class DiffusionMamba2(nn.Module):
         nonzero_mask = (t != 0).float().reshape(-1, *([1] * (len(x_t.shape) - 1)))
         return mean + nonzero_mask * torch.sqrt(var) * noise
 
+    def _ddim_timestep_schedule(self, num_steps=None):
+        """Return evenly-spaced timestep indices for DDIM sub-sampling."""
+        K = self.num_diffusion_steps
+        S = num_steps or self.inference_steps or K
+        S = min(S, K)
+        if S == K:
+            return list(range(K - 1, -1, -1))
+        # Evenly spaced, always including step 0
+        step_size = K / S
+        return [int(round((S - 1 - i) * step_size)) for i in range(S)]
+
+    @torch.no_grad()
+    def ddim_sample_action(self, obs_features, num_steps=None, eta=0.0):
+        """
+        Fast DDIM sampling.  Uses the *same* trained noise schedule but
+        skips intermediate timesteps for much fewer MLP forwards.
+
+        Args:
+            obs_features:  (B, obs_feature_dim)
+            num_steps:     Override for number of DDIM steps (default: self.inference_steps)
+            eta:           Stochasticity (0 = deterministic DDIM, 1 ≈ DDPM)
+        """
+        B = obs_features.shape[0]
+        device = obs_features.device
+        schedule = self._ddim_timestep_schedule(num_steps)
+
+        x = torch.randn(B, self.action_dim, device=device)
+        for i, t_curr in enumerate(schedule):
+            t = torch.full((B,), t_curr, device=device, dtype=torch.long)
+            pred_noise = self.predict_noise(x, obs_features, t)
+
+            alpha_t = extract(self.alphas_cumprod, t, x.shape)
+            x_0_pred = ((x - torch.sqrt(1.0 - alpha_t) * pred_noise)
+                        / torch.sqrt(alpha_t).clamp(min=1e-8))
+            x_0_pred = x_0_pred.clamp(-1.0, 1.0)
+
+            if i + 1 < len(schedule):
+                t_next = schedule[i + 1]
+                alpha_next = self.alphas_cumprod[t_next]
+            else:
+                alpha_next = torch.tensor(1.0, device=device)  # α_0 = 1
+
+            # DDIM update
+            if eta > 0 and t_curr > 0:
+                sigma = (eta * torch.sqrt((1 - alpha_next) / (1 - alpha_t).clamp(min=1e-8)
+                         * (1 - alpha_t / alpha_next.clamp(min=1e-8))))
+                dir_xt = torch.sqrt((1 - alpha_next - sigma ** 2).clamp(min=0)) * pred_noise
+                x = torch.sqrt(alpha_next) * x_0_pred + dir_xt + sigma * torch.randn_like(x)
+            else:
+                dir_xt = torch.sqrt((1 - alpha_next).clamp(min=0)) * pred_noise
+                x = torch.sqrt(alpha_next) * x_0_pred + dir_xt
+
+        return self.denormalize_action(x.clamp(-1.0, 1.0))
+
     @torch.no_grad()
     def sample_action(self, obs_features, deterministic=False):
+        """Sample action via stochastic DDPM reverse process.
+
+        The per-step noise is integral to reverse diffusion — it is NOT
+        RL exploration.  Mean-only sampling collapses to near-zero output.
+        When ``deterministic`` is True we still use the stochastic reverse
+        chain (which gives high-quality diverse actions) rather than the
+        broken mean-only path.
+        """
         B = obs_features.shape[0]
         device = obs_features.device
         x = torch.randn(B, self.action_dim, device=device)
         for k in reversed(range(self.num_diffusion_steps)):
             t = torch.full((B,), k, device=device, dtype=torch.long)
-            if deterministic:
-                mean, _, _ = self.p_mean_variance(x, obs_features, t)
-                x = mean
-            else:
-                x = self.p_sample(x, obs_features, t)
-        return x
+            x = self.p_sample(x, obs_features, t)
+        return self.denormalize_action(x.clamp(-1.0, 1.0))   # [-1,1] → raw action space
+
 
     # ------------------------------------------------------------------
     # Losses
     # ------------------------------------------------------------------
 
     def compute_diffusion_loss(self, actions, obs_features):
-        """L_diff = E_{k,ε}[||ε − ε_θ(a^k, k, o)||²]"""
+        """L_diff = E_{k,ε[||ε − ε_θ(a^k, k, o)||²]"""
+        actions = self.normalize_action(actions)
         B = actions.shape[0]
         device = actions.device
         t = torch.randint(0, self.num_diffusion_steps, (B,), device=device)
@@ -257,12 +347,19 @@ class DiffusionMamba2(nn.Module):
         return F.mse_loss(pred, noise)
 
     def compute_denoising_log_prob(self, a_prev, a_curr, obs_features, t):
-        """log p_θ(a^{k-1} | a^k, o)  — Gaussian with predicted mean, fixed var."""
         pred_noise = self.predict_noise(a_curr, obs_features, t)
-        sqrt_recip = extract(self.sqrt_recip_alphas, t, a_curr.shape)
-        beta_t = extract(self.betas, t, a_curr.shape)
-        sqrt_one_minus = extract(self.sqrt_one_minus_alphas_cumprod, t, a_curr.shape)
-        mean = sqrt_recip * (a_curr - beta_t / sqrt_one_minus * pred_noise)
+
+        # Predict x_0 from noise prediction and clamp (matches p_mean_variance)
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, a_curr.shape)
+        sqrt_one_minus_t = extract(self.sqrt_one_minus_alphas_cumprod, t, a_curr.shape)
+        x_0_pred = (a_curr - sqrt_one_minus_t * pred_noise) / sqrt_alphas_cumprod_t.clamp(min=1e-8)
+        x_0_pred = x_0_pred.clamp(-1.0, 1.0)
+
+        # Re-derive posterior mean from clamped x_0
+        coef1 = extract(self.posterior_mean_coef1, t, a_curr.shape)
+        coef2 = extract(self.posterior_mean_coef2, t, a_curr.shape)
+        mean = coef1 * x_0_pred + coef2 * a_curr
+
         var = extract(self.posterior_variance, t, a_curr.shape).clamp(min=1e-6)
         log_prob = -0.5 * ((a_prev - mean) ** 2 / var + torch.log(var)
                            + math.log(2 * math.pi))
@@ -274,6 +371,7 @@ class DiffusionMamba2(nn.Module):
         device = obs_features.device
         total = torch.zeros(B, device=device)
         K = len(denoising_chain) - 1
+        
         for step_idx in range(K):
             k = K - step_idx
             t = torch.full((B,), k, device=device, dtype=torch.long)
@@ -288,20 +386,44 @@ class DiffusionMamba2(nn.Module):
     # ------------------------------------------------------------------
 
     def sample_action_with_chain(self, obs_features, deterministic=False):
+        """
+        Sample action via full DDPM reverse process, computing chain log-prob
+        *inline* to avoid a redundant second pass through the denoising MLP.
+        """
         B = obs_features.shape[0]
         device = obs_features.device
         x = torch.randn(B, self.action_dim, device=device)
         chain = [x.clone()]
+        log_prob_accum = torch.zeros(B, device=device)
+
         for k in reversed(range(self.num_diffusion_steps)):
             t = torch.full((B,), k, device=device, dtype=torch.long)
-            if deterministic:
-                mean, _, _ = self.p_mean_variance(x, obs_features, t)
-                x = mean
+            # p_mean_variance already calls predict_noise once —
+            # reuse mean & var for both the sample and the log-prob.
+            mean, var, _ = self.p_mean_variance(x, obs_features, t)
+
+            if deterministic or k == 0:
+                x_prev = mean
             else:
-                x = self.p_sample(x, obs_features, t)
+                noise = torch.randn_like(x)
+                x_prev = mean + torch.sqrt(var) * noise
+
+            # Accumulate log p(x_{k-1} | x_k, obs) inline
+            if k > 0:
+                var_c = var.clamp(min=1e-6)
+                step_lp = -0.5 * (
+                    (x_prev - mean) ** 2 / var_c
+                    + torch.log(var_c)
+                    + math.log(2 * math.pi)
+                )
+                log_prob_accum = log_prob_accum + step_lp.sum(dim=-1)
+
+            x = x_prev
             chain.append(x.clone())
-        log_prob = self.compute_chain_log_prob(chain, obs_features)
-        return chain[-1], chain, log_prob
+
+        # chain lives in normalised [-1,1] space; clamp and return raw action
+        return self.denormalize_action(chain[-1].clamp(-1.0, 1.0)), chain, log_prob_accum
+
 
     # ------------------------------------------------------------------
     # Convenience forward (matches RLMamba2Racer signature pattern)
@@ -320,7 +442,11 @@ class DiffusionMamba2(nn.Module):
         obs_features, obs_buffer = self.encode_observation(
             scan_tensor, state_tensor, obs_buffer, max_speed_estimate
         )
-        action, chain, log_prob = self.sample_action_with_chain(
-            obs_features, deterministic=deterministic
-        )
+        if deterministic:
+            action = self.sample_action(obs_features, deterministic=True)
+            log_prob = torch.zeros(action.shape[0], device=action.device)
+        else:
+            action, _, log_prob = self.sample_action_with_chain(
+                obs_features, deterministic=False
+            )
         return action, log_prob, obs_buffer

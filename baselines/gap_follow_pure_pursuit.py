@@ -3,6 +3,32 @@ from baselines.pure_pursuit import PurePursuit
 from baselines.gap_follow import GapFollow
 
 
+# Per-map best max_speed from speed search (FAIL maps default to 5.0)
+GFPP_MAP_SPEED_LOOKUP = {
+    "Austin": 5.0,
+    "BrandsHatch": 11.0,
+    "Budapest": 12.0,
+    "Catalunya": 11.5,
+    "Hockenheim": 11.0,
+    "IMS": 8.5,
+    "Melbourne": 11.0,
+    "MexicoCity": 10.0,
+    "Monza": 7.0,
+    "MoscowRaceway": 13.0,
+    "Nuerburgring": 11.0,
+    "Oschersleben": 10.0,
+    "Sakhir": 10.5,
+    "SaoPaulo": 12.5,
+    "Sepang": 11.0,
+    "Silverstone": 9.0,
+    "Sochi": 12.0,
+    "Spa": 5.0,
+    "Spielberg": 10.5,
+    "YasMarina": 5.0,
+    "Zandvoort": 10.0,
+}
+
+
 class GapFollowPurePursuit:
     """
     Hybrid controller that blends Pure Pursuit (raceline tracking) with
@@ -31,7 +57,7 @@ class GapFollowPurePursuit:
         wheelbase=0.33,
         max_steering=0.4189,
         max_speed=12.0,
-        min_speed=2.0,
+        min_speed=1.0,
         lookahead_distance=1.5,
         num_beams=1080,
         fov=4.7,
@@ -46,6 +72,8 @@ class GapFollowPurePursuit:
         # GapFollow overrides
         gf_max_speed=None,
         gf_min_speed=None,
+        # Optional hard speed cap (None = no extra limit)
+        speed_clamp=None,
         **_kwargs,
     ):
         """
@@ -107,6 +135,13 @@ class GapFollowPurePursuit:
         self.map_name = map_name
         self.max_speed = max_speed
         self.min_speed = min_speed
+        self.speed_clamp = speed_clamp
+
+        # Apply per-map speed from lookup
+        map_speed = GFPP_MAP_SPEED_LOOKUP.get(map_name)
+        if map_speed is not None:
+            self.max_speed = map_speed
+            self.pp.max_speed = map_speed
 
     # ------------------------------------------------------------------
     # Obstacle detection
@@ -172,9 +207,13 @@ class GapFollowPurePursuit:
             gf_action = self.gf.get_action(obs, agent_idx=agent_idx)
             steering = gf_action[0]
             speed = min(pp_action[1], gf_action[1])
-            return np.array([steering, speed])
+            action = np.array([steering, speed])
         else:
-            return pp_action
+            action = pp_action
+
+        if self.speed_clamp is not None:
+            action[1] = min(action[1], self.speed_clamp)
+        return action
 
     def get_actions_batch(self, obs, **_kwargs):
         """Get actions for every agent in the observation.
@@ -194,3 +233,9 @@ class GapFollowPurePursuit:
         self.pp.update_map(map_name)
         self.gf.update_map(map_name)
         self._obstacle_flag.clear()
+
+        # Apply per-map speed from lookup
+        map_speed = GFPP_MAP_SPEED_LOOKUP.get(map_name)
+        if map_speed is not None:
+            self.max_speed = map_speed
+            self.pp.max_speed = map_speed

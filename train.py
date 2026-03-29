@@ -3,12 +3,15 @@ import gym
 import numpy as np
 from D2PPO_agent import D2PPOAgent as PPOAgent
 # from utils.control_handler import ControlHandler
+from baselines.mpc_agent import MPCAgent
 from baselines.pure_pursuit import PurePursuit
 from utils.utils import *
+from track_generator import TrackGenerator
 import torch
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
 import random
+import shutil
 
 params_dict = {'mu': 1.0489,
                'C_Sf': 4.718,
@@ -31,24 +34,37 @@ params_dict = {'mu': 1.0489,
                }
 
 # --- Main Training Parameters ---
-NUM_AGENTS_AI = 8
+NUM_AGENTS_AI = 6
 NUM_AGENTS_PP = 4
 NUM_AGENTS = NUM_AGENTS_AI + NUM_AGENTS_PP
 EASY_MAPS = ["Hockenheim", "Monza", "Melbourne", "BrandsHatch"]
 MEDIUM_MAPS = ["Oschersleben", "Sakhir", "Sepang", "SaoPaulo", "Budapest", "Catalunya", "Silverstone"]
-HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Austin", "Nuerburgring", "Spa", "YasMarina", "Sochi",]
+HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Nuerburgring", "Sochi",]
 TOTAL_TIMESTEPS = 12_000_000
-STEPS_PER_GENERATION = 256
+STEPS_PER_GENERATION = 2048
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = None # Generated later
 CURRENT_MAP = "Catalunya" # Starting map, used for pretraining
 PATIENCE = 200  # Early stopping patience
-GEN_PER_MAP = 60
+GEN_PER_MAP = 16  # Generations per track (let Mamba2 buffer fill for localization)
 
 def get_curriculum_map_pool(generation, selector=None):
     """Returns the appropriate map pool based on training progress."""
     return EASY_MAPS + MEDIUM_MAPS + HARD_MAPS  # Phase 3: Full curriculum
+
+# --- Track Generator ---
+track_gen = TrackGenerator(
+    min_track_length=50,
+    max_track_length=600,
+    min_turns=6,
+    max_turns=35,
+    min_track_width=0.5,
+    max_track_width=2.0,
+    min_turn_radius=3.0,
+    seed=None,  # Random every time
+)
+_last_generated_track = None  # Track cleanup bookkeeping
 
 # -- Environment Setup ---
 env = gym.make(
@@ -68,7 +84,7 @@ env.render(mode="human") # Render first to create the window/renderer
 num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 
 ORIGINAL_WEIGHT = "models/actor/pretrained/actor_pretrained.pt"
-CRITIC_WEIGHT = None#"models/critic/pretrained/critic_pretrained.pt"
+CRITIC_WEIGHT = "models/critic/pretrained/critic_pretrained.pt"
 
 agent = PPOAgent(
     num_agents=NUM_AGENTS_AI, 
@@ -77,13 +93,16 @@ agent = PPOAgent(
     params=params_dict,
     transfer=[ORIGINAL_WEIGHT, CRITIC_WEIGHT]
 )
-pp_driver = PurePursuit(
+pp_driver = MPCAgent(
     map_name=CURRENT_MAP,
-    lookahead_points=20,
     wheelbase=params_dict['lf'] + params_dict['lr'],
     max_steering=params_dict['s_max'],
-    max_speed=5.0,
-    min_speed=1.5
+    num_beams=LIDAR_BEAMS,
+    fov=LIDAR_FOV,
+    horizon=8,
+    speed_scale=0.8,
+    emergency_dist=0.8,
+    speed_clamp=7.5
 )
 
 if hasattr(torch, 'compile'):
@@ -92,24 +111,53 @@ if hasattr(torch, 'compile'):
 
 # --- Critic Pretraining (live rollouts with real reward function) ---
 ALL_PRETRAIN_MAPS = EASY_MAPS + MEDIUM_MAPS
-agent.pretrain_critic(
-    env=env,
-    pp_driver=pp_driver,
-    num_agents_total=NUM_AGENTS,
-    maps=ALL_PRETRAIN_MAPS,
-    rollout_steps=STEPS_PER_GENERATION,
-    num_rollouts=len(ALL_PRETRAIN_MAPS),
-    epochs=15,
-    lr=5e-4,
-    batch_size=256,
-)
+if CRITIC_WEIGHT is None:
+    agent.pretrain_critic(
+        env=env,
+        pp_driver=agent.mpc,
+        num_agents_total=NUM_AGENTS,
+        maps=ALL_PRETRAIN_MAPS,
+        rollout_steps=8000,
+        num_rollouts=len(ALL_PRETRAIN_MAPS),
+        epochs=2,
+        lr=5e-4,
+        batch_size=256,
+        # load_demos_path="demos/critic_demos.pt",
+    )
+    torch.save(agent.critic_network.state_dict(), f"models/critic/pretrained/critic_pretrained.pt")
 
-# Restore starting map after pretraining
+# Generate a fresh random track to start training on
+def _switch_to_new_track(gen_label="init"):
+    """Generate a new random track, switch env/agents to it, and clean up the old one."""
+    global CURRENT_MAP, _last_generated_track, INITIAL_POSES
+    # Clean up previous generated track
+    if _last_generated_track is not None:
+        old_dir = os.path.join("maps", _last_generated_track)
+        if os.path.isdir(old_dir):
+            shutil.rmtree(old_dir, ignore_errors=True)
+        _last_generated_track = None
+
+    track_name = f"gen_track_{gen_label}"
+    try:
+        track_gen.generate(track_name)
+        CURRENT_MAP = track_name
+        _last_generated_track = track_name
+    except RuntimeError as e:
+        # Fallback to a random real map if generation fails
+        print(f"Track generation failed ({e}), falling back to real map")
+        available = EASY_MAPS + MEDIUM_MAPS + HARD_MAPS
+        CURRENT_MAP = random.choice(available)
+        _last_generated_track = None
+
+    INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
+    env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
+    wp_xy, wp_s, rl = agent._load_waypoints(CURRENT_MAP)
+    agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = wp_xy, wp_s, rl
+    pp_driver.update_map(CURRENT_MAP)
+    return INITIAL_POSES
+
+_switch_to_new_track("init")
 agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
-env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
-wp_xy, wp_s, rl = agent._load_waypoints(CURRENT_MAP)
-agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = wp_xy, wp_s, rl
-pp_driver.update_map(CURRENT_MAP)
 obs, _, _, _ = env.reset(poses=INITIAL_POSES)
 
 # STEPS_PER_GENERATION = int(agent.raceline_length * 32)  # Adjust steps based on raceline length and desired time per generation
@@ -225,7 +273,6 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
     reward_avg = sum(total_reward_this_gen) / len(total_reward_this_gen)
     current_avg_ego_reward = sum(ego_reward_this_gen) / len(total_reward_this_gen)
 
-    
     if reward_avg > best_avg_reward:
         torch.save(agent.actor_network.state_dict(), f"models/actor/best/actor_gen_{gen+1}.pt")
         torch.save(agent.critic_network.state_dict(), f"models/critic/best/critic_gen_{gen+1}.pt")
@@ -248,28 +295,12 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
     #     print("Early stopping triggered due to no improvement.")
     #     break
     
+    # --- Switch to a new random track every GEN_PER_MAP generations ---
     if (gen + 1) % GEN_PER_MAP == 0:
-        available_maps = get_curriculum_map_pool(gen+1)
-        next_map = CURRENT_MAP
-        while next_map == CURRENT_MAP:
-            next_map = random.choice(available_maps)
-        CURRENT_MAP = next_map
-        print(f"Gen {gen+1}: Map={CURRENT_MAP}, Pool size={len(available_maps)}")
-        
-        INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
-        env.update_map(get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map", ".png")
-        
-        waypoints_xy, waypoints_s, raceline_length = agent._load_waypoints(CURRENT_MAP)
-        agent.waypoints_xy = waypoints_xy
-        agent.waypoints_s = waypoints_s
-        agent.raceline_length = raceline_length
-        agent.last_cumulative_distance = np.zeros(NUM_AGENTS_AI) 
+        _switch_to_new_track(gen + 1)
+        print(f"Gen {gen+1}: New track \u2192 {CURRENT_MAP}")
+        agent.last_cumulative_distance = np.zeros(NUM_AGENTS_AI)
         agent.last_wp_index = np.zeros(NUM_AGENTS_AI, dtype=np.int32)
-
-        # STEPS_PER_GENERATION = int(raceline_length * 32)
-        # agent.update_buffer_size(STEPS_PER_GENERATION)
-        print(f"Adjusted steps per generation to {STEPS_PER_GENERATION} based on raceline length.")
-
         env.reset(poses=INITIAL_POSES)
         agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
         agent.reset_buffers()
@@ -278,6 +309,12 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
 torch.save(agent.actor_network.state_dict(), f"models/actor/checkpoint/actor_gen_FINAL.pt")
 torch.save(agent.critic_network.state_dict(), f"models/critic/checkpoint/critic_gen_FINAL.pt")
 print(f"Checkpoint saved at final generation.")
+
+# Clean up last generated track
+if _last_generated_track is not None:
+    old_dir = os.path.join("maps", _last_generated_track)
+    if os.path.isdir(old_dir):
+        shutil.rmtree(old_dir, ignore_errors=True)
         
 # --- END OF TRAINING ---
 env.close()

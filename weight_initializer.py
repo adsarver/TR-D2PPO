@@ -1,7 +1,7 @@
 """
 weight_initializer.py — Behavioral Cloning Pre-training for DiffusionLSTM
 ==========================================================================
-Collects expert demonstrations from the GapFollowPurePursuit baseline
+Collects expert demonstrations from the MPC baseline
 across multiple maps, then trains the DiffusionLSTM diffusion actor using
 the D²PPO Stage-1 objective:
 
@@ -32,9 +32,11 @@ import gym
 
 from models.AuxModels import VisionEncoder
 from models.DiffusionLSTM import DiffusionLSTM
-from baselines.gap_follow_pure_pursuit import GapFollowPurePursuit
-from utils.utils import get_map_dir, generate_start_poses
+from models.DiffusionMamba2 import DiffusionMamba2
+from utils.diffusion_utils import cosine_beta_schedule, linear_beta_schedule
 from utils.diffusion_utils import extract
+from baselines.mpc_agent import MPCAgent
+from utils.utils import get_map_dir, generate_start_poses
 
 # Dispersive loss functions (same as D2PPO_agent.py)
 def dispersive_loss_infonce_l2(features, temperature=0.5):
@@ -82,6 +84,7 @@ def _collect_single_map(
     num_agents: int,
     steps_per_map: int,
     collision_reset_threshold: int,
+    num_noise_agents: int = 16,
 ) -> list[dict]:
     """
     Worker function executed in its own process.
@@ -91,39 +94,58 @@ def _collect_single_map(
     # Each process must import gym afresh (env has C state)
     import gym as _gym
     demos: list[dict] = []
+    
+    total_agents = num_agents + num_noise_agents
 
     env = _gym.make(
         "f110_gym:f110-v0",
         map=get_map_dir(map_name) + f"/{map_name}_map",
-        num_agents=num_agents,
+        num_agents=total_agents,
         num_beams=NUM_BEAMS,
         fov=LIDAR_FOV,
         params=PARAMS_DICT,
     )
 
-    expert = GapFollowPurePursuit(
+    expert = MPCAgent(
         map_name=map_name,
         wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
         max_steering=PARAMS_DICT['s_max'],
-        max_speed=8.0,
-        min_speed=0.5,
+        max_accel=PARAMS_DICT['a_max'],
+        LIDAR_FOV=LIDAR_FOV,
         num_beams=NUM_BEAMS,
-        fov=LIDAR_FOV,
+        horizon=8,
+        speed_scale=0.8,
+        emergency_dist=0.8,
+    )
+    
+    noise_agents = MPCAgent(
+        map_name=map_name,
+        wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
+        max_steering=PARAMS_DICT['s_max'],
+        max_accel=PARAMS_DICT['a_max'],
+        LIDAR_FOV=LIDAR_FOV,
+        num_beams=NUM_BEAMS,
+        horizon=8,
+        speed_scale=0.8,
+        emergency_dist=0.8,
+        speed_clamp=7.5
     )
 
-    poses = generate_start_poses(map_name, num_agents)
+    poses = generate_start_poses(map_name, total_agents)
     obs, _, _, _ = env.reset(poses=poses)
 
-    collision_timers = np.zeros(num_agents, dtype=np.int32)
+    collision_timers = np.zeros(total_agents, dtype=np.int32)
 
     for step in range(steps_per_map):
         actions = expert.get_actions_batch(obs)  # (N, 2)
-
+        noise_actions = noise_agents.get_actions_batch(obs)
+        actions[num_agents:] = noise_actions[:num_noise_agents]  # Add noise agents at the end
+        
         next_obs, _, _, _ = env.step(actions)
 
         # Collision / stuck detection
-        collisions = np.array(next_obs["collisions"][:num_agents])
-        velocities = np.array(next_obs["linear_vels_x"][:num_agents])
+        collisions = np.array(next_obs["collisions"])
+        velocities = np.array(next_obs["linear_vels_x"])
 
         for a_idx in range(num_agents):
             scan_np = np.asarray(obs["scans"][a_idx], dtype=np.float32)
@@ -143,8 +165,8 @@ def _collect_single_map(
                 # Reward-relevant fields (for critic pretraining)
                 "step":   step,
                 "agent":  a_idx,
-                "next_velocity":  float(velocities[a_idx]),
-                "next_collision": int(collisions[a_idx]),
+                "next_velocity":  float(velocities[:num_agents][a_idx]),
+                "next_collision": int(collisions[:num_agents][a_idx]),
             })
 
         # Stuck detection → reset
@@ -157,7 +179,7 @@ def _collect_single_map(
             cur_poses = np.stack([
                 next_obs["poses_x"], next_obs["poses_y"], next_obs["poses_theta"]
             ], axis=1)
-            new_poses = generate_start_poses(map_name, num_agents, agent_poses=cur_poses)
+            new_poses = generate_start_poses(map_name, total_agents, agent_poses=cur_poses)
             next_obs, _, _, _ = env.reset(poses=new_poses, agent_idxs=to_reset)
             collision_timers[to_reset] = 0
 
@@ -176,7 +198,7 @@ def collect_demos(
     verbose: bool = True,
 ) -> list[dict]:
     """
-    Collect demonstrations from GapFollowPurePursuit across all *maps*
+    Collect demonstrations from MPC across all *maps*
     using one **process per map** for full parallelism (each process owns
     its own gym environment, avoiding any shared-state issues).
 
@@ -224,6 +246,7 @@ def collect_demos(
 
 def pretrain(
     demos: list[dict],
+    model_type: str = "lstm",
     epochs: int = 100,
     batch_size: int = 256,
     lr: float = 3e-4,
@@ -236,7 +259,7 @@ def pretrain(
     device: str | torch.device = "cuda",
 ):
     """
-    Train a fresh DiffusionLSTM on the collected demonstrations.
+    Train a fresh DiffusionLSTM or DiffusionMamba2 on the collected demonstrations.
 
     The loss is the standard DDPM noise-prediction MSE (L_diff) plus
     dispersive regularisation on intermediate denoise-MLP features (L_disp).
@@ -246,21 +269,42 @@ def pretrain(
     print(f"[Pretrain] {len(demos)} demos, {epochs} epochs, batch_size={batch_size}, lr={lr}")
 
     # ── Build model ──────────────────────────────────────────────────
-    model = DiffusionLSTM(
-            state_dim=STATE_DIM,
-            action_dim=2,
-            num_diffusion_steps=num_diffusion_steps,
-            inference_steps=5,
-            time_emb_dim=32,
-            hidden_dims=(256, 256),
-            beta_schedule="cosine",
-            odom_expand=32,
-            proj_hidden=384,
-            lstm_hidden_size=128,
-            lstm_num_layers=2,
-            memory_length=64,
-            memory_stride=4
-        ).to(device)
+    if model_type == "lstm":
+        model = DiffusionLSTM(
+                    state_dim=STATE_DIM,
+                    action_dim=2,
+                    num_diffusion_steps=num_diffusion_steps,
+                    inference_steps=5,          # DDIM fast sampling for rollout/deploy
+                    time_emb_dim=32,
+                    hidden_dims=(256, 256),
+                    beta_schedule="cosine",
+                    odom_expand=32,
+                    proj_hidden=384,
+                    lstm_hidden_size=128,
+                    lstm_num_layers=2,
+                    memory_length=64,
+                    memory_stride=118
+                ).to(device)
+    elif model_type == "mamba2":
+        model = DiffusionMamba2(
+                    state_dim=STATE_DIM,
+                    action_dim=2,
+                    num_diffusion_steps=num_diffusion_steps,
+                    inference_steps=5,          # DDIM fast sampling for rollout/deploy
+                    obs_feature_dim=64,
+                    time_emb_dim=32,
+                    hidden_dims=(256, 256),
+                    beta_schedule="cosine",
+                    d_model=64,
+                    d_state=16,
+                    d_conv=4,
+                    d_head=16,
+                    expand=2,
+                    memory_length=6000,
+                    odom_expand=32,
+                ).to(device)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
     # Register dispersive hooks on the denoising MLP (last block)
     model.denoise_net.register_dispersive_hooks("late")
@@ -269,10 +313,11 @@ def pretrain(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # ── Materialise tensors ──────────────────────────────────────────
-    all_scans   = torch.stack([torch.from_numpy(d["scan"])   for d in demos]).unsqueeze(1)  # (N, 1, 1080)
-    all_states  = torch.stack([torch.from_numpy(d["state"])  for d in demos])               # (N, 4)
-    all_actions = torch.stack([torch.from_numpy(d["action"]) for d in demos])               # (N, 2)
+    # ── Materialise tensors (keep on GPU to avoid per-batch transfers) ─
+    all_scans   = torch.stack([torch.from_numpy(d["scan"])   for d in demos]).unsqueeze(1).to(device)  # (N, 1, 1080)
+    all_states  = torch.stack([torch.from_numpy(d["state"])  for d in demos]).to(device)               # (N, 4)
+    all_actions = torch.stack([torch.from_numpy(d["action"]) for d in demos]).to(device)               # (N, 2)
+    
     N = len(demos)
     print(f"[Pretrain] Tensors ready — scans {tuple(all_scans.shape)}, "
           f"states {tuple(all_states.shape)}, actions {tuple(all_actions.shape)}")
@@ -292,39 +337,38 @@ def pretrain(
 
         for start in range(0, N, batch_size):
             idx = perm[start : start + batch_size]
-            scan_b   = all_scans[idx].to(device, non_blocking=True)
-            state_b  = all_states[idx].to(device, non_blocking=True)
-            action_b = all_actions[idx].to(device, non_blocking=True)
+            scan_b   = all_scans[idx]
+            state_b  = all_states[idx]
+            action_b = all_actions[idx]
             B = scan_b.shape[0]
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 # Encode observations (no temporal continuity for shuffled batches)
-                obs_features, _, _, _ = model.encode_observation(
-                    scan_b, state_b, obs_buffer=None, hidden_h=None, hidden_c=None,
-                )
+                if model_type == "lstm":
+                    obs_features, _, _, _ = model.encode_observation(
+                        scan_b, state_b, obs_buffer=None, hidden_h=None, hidden_c=None,
+                    )
+                else:
+                    obs_features, _ = model.encode_observation(
+                        scan_b, state_b, obs_buffer=None,
+                    )
 
                 # ── Diffusion loss (noise prediction MSE) ───────────
-                # compute_diffusion_loss normalises actions internally
+                # compute_diffusion_loss normalises actions internally.
+                # The dispersive hooks on denoise_net capture intermediate
+                # features from this forward pass — no need for a second one.
                 diff_loss = model.compute_diffusion_loss(action_b, obs_features)
 
                 # ── Dispersive loss on intermediate features ────────
-                action_norm = model.normalize_action(action_b)
-                t_rand = torch.randint(0, num_diffusion_steps, (B,), device=device)
-                noise  = torch.randn_like(action_norm)
-                noisy  = model.q_sample(action_norm, t_rand, noise=noise)
-                _      = model.denoise_net(noisy, obs_features, t_rand)
-
-                feat_dict = model.denoise_net.get_intermediate_features()
-                if isinstance(feat_dict, list):
-                    # get_intermediate_features may return a list; convert to dict
-                    feat_dict = {i: f for i, f in enumerate(feat_dict)}
+                # Hooks were triggered by compute_diffusion_loss above
+                feat_list = model.denoise_net.get_intermediate_features()
                 disp_loss = torch.tensor(0.0, device=device)
-                for _, feats in feat_dict.items():
-                    if feats.ndim > 2:
-                        feats = feats.mean(dim=list(range(1, feats.ndim - 1)))
-                    disp_loss = disp_loss + dispersive_loss_infonce_l2(feats, dispersive_temperature)
-                if len(feat_dict) > 0:
-                    disp_loss = disp_loss / len(feat_dict)
+                if feat_list:
+                    for feats in feat_list:
+                        if feats.ndim > 2:
+                            feats = feats.mean(dim=list(range(1, feats.ndim - 1)))
+                        disp_loss = disp_loss + dispersive_loss_infonce_l2(feats, dispersive_temperature)
+                    disp_loss = disp_loss / len(feat_list)
 
                 loss = (diff_loss + dispersive_lambda * disp_loss) / gradient_accumulation_steps
 
@@ -341,7 +385,13 @@ def pretrain(
             epoch_diff += diff_loss.item() * B
             epoch_disp += disp_loss.item() * B
             num_batches += 1
-
+            
+            # Progress marker
+            if num_batches % 5 == 0:
+                pct = min(start + batch_size, N) / N * 100
+                print(f"    [Epoch {epoch}/{epochs}] Batch {num_batches} "
+                      f"({pct:.1f}%)  diff={diff_loss.item():.5f}  disp={disp_loss.item():.5f}",
+                      end="\r", flush=True)
         scheduler.step()
 
         avg_diff = epoch_diff / N
@@ -381,6 +431,7 @@ def pretrain(
 def pretrain_critic(
     demos: list[dict],
     actor_state_dict: dict,
+    model_type: str = "lstm",
     epochs: int = 30,
     batch_size: int = 256,
     lr: float = 5e-4,
@@ -407,14 +458,14 @@ def pretrain_critic(
     Falls back to ``state[0]`` (vel_x) when demos lack ``next_velocity``
     (backward compat with older demo files).
     """
-    from models.CriticNetworks import CriticNetwork
+    from models.CriticNetworks import CriticNetwork, Mamba2CriticNetwork
     from models.AuxModels import VisionEncoder
 
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"\n{'=' * 60}")
     print("  CRITIC PRE-TRAINING  (weight_initializer)")
     print(f"{'=' * 60}")
-    print(f"  {len(demos)} demos, {epochs} epochs, batch={batch_size}, "
+    print(f"  {len(demos)} demos, {epochs} epochs, {batch_size} batch, "
           f"lr={lr}, γ={gamma}")
 
     has_reward_fields = ("next_velocity" in demos[0])
@@ -443,16 +494,31 @@ def pretrain_critic(
             print(f"  Loaded {len(filtered)}/{len(ref_sd)} actor CNN weights "
                   f"into critic encoder.")
 
-    critic = CriticNetwork(
-        state_dim=STATE_DIM,
-        encoder=encoder,
-        lstm_hidden_size=64,
-        lstm_num_layers=2,
-        memory_length=48,
-        memory_stride=100,
-        odom_expand=64,
-        proj_hidden=256,
-    ).to(device)
+    if model_type == "lstm":
+        critic = CriticNetwork(
+            state_dim=STATE_DIM,
+            encoder=encoder,
+            lstm_hidden_size=64,
+            lstm_num_layers=2,
+            memory_length=64,
+            memory_stride=118,
+            odom_expand=64,
+            proj_hidden=256,
+        ).to(device)
+    elif model_type == "mamba2":
+        critic = Mamba2CriticNetwork(
+            state_dim=STATE_DIM,
+            encoder=encoder,
+            d_model=64,
+            d_state=16,
+            d_conv=4,
+            d_head=16,
+            expand=2,
+            memory_length=7500,
+            odom_expand=64,
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
     # Freeze vision encoder (already pretrained)
     for p in critic.conv_layers.parameters():
@@ -535,7 +601,11 @@ def pretrain_critic(
             st = X_states[idx]
             y  = Y_returns[idx]
 
-            feat, _, _, _ = critic.encode_observation(s, st, obs_buffer=None)
+            if model_type == "lstm":
+                feat, _, _, _ = critic.encode_observation(s, st, obs_buffer=None)
+            else:
+                feat, _ = critic.encode_observation(s, st, obs_buffer=None)
+            
             pred = critic.fc_layers(feat).squeeze(-1)
             loss = F.smooth_l1_loss(pred, y)
 
@@ -574,17 +644,17 @@ def main():
         "Hockenheim", "Monza", "Melbourne", "BrandsHatch",
         "Oschersleben", "Sakhir", "Sepang", "SaoPaulo",
         "Budapest", "Catalunya", "Silverstone",
-        "Zandvoort", "MoscowRaceway", "Austin", "Nuerburgring",
-        "Spa", "YasMarina", "Sochi",
+        "Zandvoort", "MoscowRaceway", "Nuerburgring",
+        "Sochi",
     ]
 
-    parser = argparse.ArgumentParser(description="D²PPO Stage 1: BC Pre-training from GapFollowPurePursuit")
+    parser = argparse.ArgumentParser(description="D²PPO Stage 1: BC Pre-training from MPC")
     # Demo collection
     parser.add_argument("--maps", nargs="+", default=ALL_MAPS,
                         help="Maps to collect demos on (default: all)")
     parser.add_argument("--num_agents", type=int, default=4,
                         help="Agents per env during collection")
-    parser.add_argument("--steps_per_map", type=int, default=8000,
+    parser.add_argument("--steps_per_map", type=int, default=3000,
                         help="Env steps per map during collection")
     parser.add_argument("--max_workers", type=int, default=None,
                         help="Parallel processes for demo collection (default: min(num_maps, cpu_count))")
@@ -593,12 +663,14 @@ def main():
     parser.add_argument("--save_demos", type=str, default="demos/expert_demos.pt",
                         help="Where to save collected demos for reuse")
     # Actor training
+    parser.add_argument("--model_type", type=str, default="lstm", choices=["lstm", "mamba2"],
+                        help="Network architecture backbone (lstm or mamba2)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--dispersive_lambda", type=float, default=0.1)
+    parser.add_argument("--dispersive_lambda", type=float, default=0.5)
     parser.add_argument("--num_diffusion_steps", type=int, default=10)
-    parser.add_argument("--gradient_accumulation", type=int, default=1)
+    parser.add_argument("--gradient_accumulation", type=int, default=2)
     # Actor output
     parser.add_argument("--save_dir", type=str, default="models/actor/pretrained")
     parser.add_argument("--save_name", type=str, default="actor_pretrained.pt")
@@ -632,6 +704,7 @@ def main():
     # ── Train actor ──────────────────────────────────────────────────
     model = pretrain(
         demos=demos,
+        model_type=args.model_type,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
@@ -653,7 +726,11 @@ def main():
         states = torch.stack([torch.from_numpy(demos[i]["state"]) for i in sample_idx]).to(device)
         expert = torch.stack([torch.from_numpy(demos[i]["action"]) for i in sample_idx]).to(device)
 
-        obs_feat, _, _, _ = model.encode_observation(scans, states, obs_buffer=None)
+        if args.model_type == "lstm":
+            obs_feat, _, _, _ = model.encode_observation(scans, states, obs_buffer=None)
+        else:
+            obs_feat, _ = model.encode_observation(scans, states, obs_buffer=None)
+            
         sampled = model.sample_action(obs_feat, deterministic=True)
 
         print(f"  Expert actions (first 4): {expert[:4].cpu().numpy()}")
@@ -668,6 +745,7 @@ def main():
         pretrain_critic(
             demos=demos,
             actor_state_dict=actor_sd,
+            model_type=args.model_type,
             epochs=args.critic_epochs,
             batch_size=args.batch_size,
             lr=args.critic_lr,

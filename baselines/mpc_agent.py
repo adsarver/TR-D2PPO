@@ -14,6 +14,32 @@ import os
 import numpy as np
 
 
+# Per-map best max_speed from speed search (FAIL maps default to 5.0)
+MPC_MAP_SPEED_LOOKUP = {
+    "Austin": 5.0,
+    "BrandsHatch": 10.5,
+    "Budapest": 12.0,
+    "Catalunya": 12.0,
+    "Hockenheim": 10.0,
+    "IMS": 10.0,
+    "Melbourne": 10.5,
+    "MexicoCity": 11.5,
+    "Monza": 10.0,
+    "MoscowRaceway": 12.0,
+    "Nuerburgring": 10.0,
+    "Oschersleben": 11.0,
+    "Sakhir": 11.0,
+    "SaoPaulo": 12.0,
+    "Sepang": 11.0,
+    "Silverstone": 9.5,
+    "Sochi": 9.0,
+    "Spa": 5.0,
+    "Spielberg": 10.0,
+    "YasMarina": 5.0,
+    "Zandvoort": 9.0,
+}
+
+
 class MPCAgent:
     """
     Raceline-following + LiDAR-reactive fan-of-trajectories planner.
@@ -41,7 +67,7 @@ class MPCAgent:
         wheelbase=0.33,
         max_steering=0.34,
         max_speed=14.0,
-        min_speed=0.0,
+        min_speed=1.0,
         max_accel=3.0,
         speed_scale=1.2,
         # MPC horizon
@@ -64,6 +90,8 @@ class MPCAgent:
         # LiDAR geometry (must match env)
         num_beams=1080,
         fov=4.7,
+        # Optional hard speed cap (None = no extra limit)
+        speed_clamp=None,
         **_kwargs,
     ):
         self.map_name = map_name
@@ -107,6 +135,12 @@ class MPCAgent:
         self.obstacle_ahead = False
         self.raceline_steer = 0.0
         self.front_clearance = max_sight
+        self.speed_clamp = speed_clamp
+
+        # Apply per-map speed from lookup
+        map_speed = MPC_MAP_SPEED_LOOKUP.get(map_name)
+        if map_speed is not None:
+            self.max_speed = map_speed
 
         # Load map
         self._load_map(map_name)
@@ -145,6 +179,12 @@ class MPCAgent:
     def update_map(self, map_name):
         """Switch to a new map and reload waypoints."""
         self.map_name = map_name
+
+        # Apply per-map speed from lookup
+        map_speed = MPC_MAP_SPEED_LOOKUP.get(map_name)
+        if map_speed is not None:
+            self.max_speed = map_speed
+
         self._load_map(map_name)
 
     # ------------------------------------------------------------------ #
@@ -606,6 +646,8 @@ class MPCAgent:
             # Also cap speed to gap-follow speed when obstacle very close
             speed_cmd = min(speed_cmd, gap_speed)
 
+        if self.speed_clamp is not None:
+            speed_cmd = min(speed_cmd, self.speed_clamp)
         return np.array([steer_cmd, speed_cmd])
 
     def get_actions_batch(self, obs, **_kwargs):

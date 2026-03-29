@@ -1,0 +1,3 @@
+algorithm,best_params,best_max_speed,best_avg_lap_time,completion_rate
+GapFollowPurePursuit,"{'lookahead_distance': 1.4, 'threshold_at_v_min': 1.0, 'threshold_at_v_max': 2.5}",7.0,57.234,0.571
+MPCAgent,"{'horizon': 8, 'speed_scale': 0.8, 'emergency_dist': 0.8}",7.0,57.573,0.429

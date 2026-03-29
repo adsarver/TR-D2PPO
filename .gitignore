@@ -6,3 +6,5 @@ models/critic/*
 *.pkl
 *.whl
 demos/*
+maps/gen_*
+maps/val_*
