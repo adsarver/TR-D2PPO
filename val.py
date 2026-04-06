@@ -63,8 +63,8 @@ BEST_MPC_PARAMS = {
 # ──────────────────────────────────────────────────────────────────────
 NUM_AGENTS = 3  # D2PPO, GFPP, MPC
 AGENT_NAMES = ["D2PPO", "GFPP", "MPC"]
-DEFAULT_ACTOR = "models/actor/best/actor_gen_58.pt"
-DEFAULT_CRITIC = "models/critic/pretrained/critic_pretrained.pt"
+DEFAULT_ACTOR = "actor_gen_36.pt"
+DEFAULT_CRITIC = 'models/actor/pretrained/actor_pretrained.pt'
 DEFAULT_RACES = 10
 DEFAULT_LAPS = 3
 LAP_TIMEOUT = 300.0        # seconds per race before giving up

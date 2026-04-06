@@ -8,3 +8,5 @@ models/critic/*
 demos/*
 maps/gen_*
 maps/val_*
+maps/test_*
+maps/debug_*

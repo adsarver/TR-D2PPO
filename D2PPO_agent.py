@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from tensordict import TensorDict
 from baselines.mpc_agent import MPCAgent
 from models.AuxModels import VisionEncoder
@@ -63,6 +64,10 @@ class D2PPOAgent:
         # Diffusion config
         num_diffusion_steps=10,
         beta_schedule="cosine",
+        baseline_speed=7.5,
+        # TBTT config (0 = disabled, uses shuffled minibatches)
+        tbtt_length=0,
+        checkpoint_every=0,
     ):
         # --- Hyperparameters ---
         self.num_agents = num_agents
@@ -77,7 +82,6 @@ class D2PPOAgent:
         self.state_dim = 4
         self.num_scan_beams = 1080
         self.lidar_fov = 4.7
-        self.image_size = 256
         self.minibatch_size = 128
         self.epochs = 3 
         self.params = params
@@ -90,8 +94,12 @@ class D2PPOAgent:
             horizon=8,
             speed_scale=0.8,
             emergency_dist=0.8,
-            speed_clamp=12.0
+            speed_clamp=baseline_speed
         )
+
+        # --- TBTT config ---
+        self.tbtt_length = tbtt_length
+        self.checkpoint_every = checkpoint_every
 
         # --- Advantage-weighted diffusion config ---
         self.num_diffusion_steps = num_diffusion_steps
@@ -112,17 +120,23 @@ class D2PPOAgent:
         # --- Reward Scalars ---
         self.LAP_REWARD = 80.0
         self.CHECKPOINT_REWARD = self.LAP_REWARD * 0.1
-        self.COLLISION_PENALTY = -4.0
-        self.SPEED_REWARD = 5.0
-        self.AGENT_COLLISION_PENALTY = -2.0
+        self.COLLISION_PENALTY = -8.0
+        self.SPEED_REWARD = 1.5
+        self.PROGRESS_REWARD = 2.0        # Per-meter forward progress along raceline
+        self.AGENT_COLLISION_PENALTY = -4.0
         self.NUM_CHECKPOINTS = 10
         self._prev_lap_counts = np.zeros(self.num_agents, dtype=int)
+
+        # --- Running reward normalisation (EMA across generations) ---
+        self._reward_ema_mean = 0.0
+        self._reward_ema_var = 1.0
 
         # --- Networks ---
         actor_encoder = self._transfer_vision(transfer[0])
         critic_encoder = self._transfer_vision(transfer[0])
 
         # Diffusion Policy Actor (Mamba2 temporal backbone)
+        self.stride = 50
         self.actor_network = DiffusionMamba2(
             state_dim=self.state_dim,
             action_dim=2,
@@ -131,14 +145,15 @@ class D2PPOAgent:
             inference_steps=5,          # DDIM fast sampling for rollout/deploy
             obs_feature_dim=64,
             time_emb_dim=32,
-            hidden_dims=(256, 256),
+            hidden_dims=(128, 128),
             beta_schedule=beta_schedule,
             d_model=64,
             d_state=16,
             d_conv=4,
             d_head=16,
             expand=2,
-            memory_length=7500,
+            memory_length=128,
+            memory_stride=self.stride,
             odom_expand=32,
         ).to(self.device)
 
@@ -154,7 +169,8 @@ class D2PPOAgent:
             d_conv=4,
             d_head=8,
             expand=2,
-            memory_length=7500,
+            memory_length=128,
+            memory_stride=self.stride,
             odom_expand=32,
         ).to(self.device)
 
@@ -174,6 +190,7 @@ class D2PPOAgent:
         # --- On-policy transition storage (ordered list for correct GAE) ---
         self.buffer = []
         self._last_obs_features = None  # Cached by get_action_and_value for store_transition
+        self._pending_transition = None  # Deferred write for next/state_value
 
         # --- Diagnostics ---
         self.plot_save_path = "plots/d2ppo_training_diagnostics.png"
@@ -204,10 +221,62 @@ class D2PPOAgent:
         # (the sim's linear_accel_x is always 0)
         self._prev_vels_x = np.zeros(self.num_agents)
         self._sim_dt = 0.01  # f110_gym default timestep
+
+        # --- Deployment mode ---
+        self._deploy_mode = False
+        self._deploy_action_repeat = 1      # run inference every N sim steps
+        self._deploy_ddim_steps = 2         # DDIM steps in deploy mode
+        self._cached_action = None          # last action for repeating
+        self._action_repeat_counter = 0     # counts sim steps since last inference
         
-    def update_buffer_size(self, new_size):
+    def clear_experience_buffer(self):
         self.buffer = []
-        print(f"Cleared transition buffer (new generation size: {new_size})")
+        self._pending_transition = None
+
+    # ------------------------------------------------------------------
+    # Deployment mode  (optimised for Jetson Orin Nano ~100 Hz)
+    # ------------------------------------------------------------------
+    def deploy(self, action_repeat=5, ddim_steps=2, compile_model=True):
+        """Switch to optimised deployment inference.
+
+        Optimisations applied:
+        1. DDIM-``ddim_steps`` instead of full 10-step DDPM (5-10x fewer
+           denoiser calls).
+        2. Action repeat — only run inference every ``action_repeat`` sim
+           steps; intermediate steps reuse the cached action.
+        3. Full fp16 inference (safe with ≤2 DDIM steps).
+        4. ``torch.compile`` for fused kernels (optional, ~2x on Ampere+).
+        5. Critic network is deleted to free VRAM.
+
+        Call once after loading weights, before the eval / deployment loop.
+        """
+        self._deploy_mode = True
+        self._deploy_action_repeat = max(1, action_repeat)
+        self._deploy_ddim_steps = max(1, ddim_steps)
+        self._cached_action = None
+        self._action_repeat_counter = 0
+
+        # Drop critic — not needed during deployment
+        if hasattr(self, 'critic_network'):
+            del self.critic_network
+            del self.critic_buffer
+            del self.critic_optimizer
+            del self.critic_scaler
+            torch.cuda.empty_cache()
+
+        self.actor_network.eval()
+        self.actor_network.half()  # fp16 weights
+
+        if compile_model:
+            try:
+                self.actor_network = torch.compile(
+                    self.actor_network, mode="reduce-overhead")
+                print("[deploy] torch.compile applied (reduce-overhead)")
+            except Exception as e:
+                print(f"[deploy] torch.compile unavailable: {e}")
+
+        print(f"[deploy] DDIM-{self._deploy_ddim_steps}, "
+              f"action_repeat={self._deploy_action_repeat}, fp16=True")
 
     # ------------------------------------------------------------------
     # Critic pretraining  (run once before RL loop)
@@ -471,6 +540,10 @@ class D2PPOAgent:
         only need the value estimate (e.g. for bootstrapping next-state value)
         and the temporal state is left untouched.
         """
+        # ----- Fast deploy path (action repeat + DDIM-few + fp16) -----
+        if self._deploy_mode:
+            return self._get_action_deploy(scan_tensor, state_tensor)
+
         self.actor_network.eval()
         self.critic_network.eval()
         value = None
@@ -523,11 +596,16 @@ class D2PPOAgent:
                     t = torch.full((B,), k, device=device, dtype=torch.long)
                     x = self.actor_network.p_sample(x, obs_features_f32, t)
                 action = self.actor_network.denormalize_action(x.clamp(-1.0, 1.0))
-                chain, log_prob = None, None
+                log_prob = None
             else:
-                action, chain, log_prob = self.actor_network.sample_action_with_chain(
-                    obs_features_f32, deterministic=deterministic
+                # DDIM-5: 5 denoiser MLP calls instead of 10 DDPM steps.
+                # eta=0.5 preserves stochasticity for exploration.
+                # log_prob is unused by AWR, so we skip the expensive
+                # inline log-prob computation of sample_action_with_chain.
+                action = self.actor_network.ddim_sample_action(
+                    obs_features_f32, num_steps=5, eta=0.5
                 )
+                log_prob = None
 
             # Safety: clamp to valid action range & replace any residual NaN
             action = action.clamp(
@@ -550,13 +628,13 @@ class D2PPOAgent:
 
 
     def store_transition(self, obs, next, action, log_prob, reward, done, value):
-        next_scans, next_states = self._obs_to_tensors(next)
-
-        _, _, next_value = self.get_action_and_value(
-            next_scans, next_states, store=False
-        )
-
         done_tensor = torch.tensor(done, dtype=torch.bool).unsqueeze(-1)
+
+        # Finalize the previous pending transition: its next/state_value
+        # is this step's state_value (same obs, same critic buffer state).
+        if self._pending_transition is not None:
+            self._pending_transition["next", "state_value"] = value
+            self.buffer.append(self._pending_transition)
 
         step_data = TensorDict(
             {
@@ -569,7 +647,7 @@ class D2PPOAgent:
                 "state_value": value,
                 "next": TensorDict(
                     {
-                        "state_value": next_value,
+                        "state_value": torch.zeros_like(value),  # placeholder
                         "reward": reward,
                         "done": done_tensor,
                     }
@@ -577,7 +655,18 @@ class D2PPOAgent:
             },
             batch_size=[self.num_agents],
         )
-        self.buffer.append(step_data.to(self.device))
+        self._pending_transition = step_data.to(self.device)
+
+    def finalize_rollout(self, next_obs):
+        """Flush the last pending transition with a single bootstrap call."""
+        if self._pending_transition is not None:
+            next_scans, next_states = self._obs_to_tensors(next_obs)
+            _, _, next_value = self.get_action_and_value(
+                next_scans, next_states, store=False
+            )
+            self._pending_transition["next", "state_value"] = next_value
+            self.buffer.append(self._pending_transition)
+            self._pending_transition = None
 
     def calculate_reward(self, next_obs):
         collisions = np.array(next_obs["collisions"][:self.num_agents])
@@ -590,30 +679,41 @@ class D2PPOAgent:
         agent_collisions = collisions == 2
         rewards = np.zeros(self.num_agents)
 
-        # --- Track position for checkpoints / laps (no progress reward) ---
-        # for i in range(self.num_agents):
-        #     projected_s, new_wp_idx = self._project_to_raceline(
-        #         positions[i],
-        #         self.last_wp_index[i],
-        #         lookahead=50,
-        #     )
+        # --- Track progress: checkpoints + continuous forward progress ---
+        for i in range(self.num_agents):
+            projected_s, new_wp_idx = self._project_to_raceline(
+                positions[i],
+                self.last_wp_index[i],
+                lookahead=50,
+            )
 
-        #     # Guard against NaN positions (e.g. from NaN actions)
-        #     if np.isnan(projected_s):
-        #         projected_s = self.last_cumulative_distance[i]
-        #         new_wp_idx = self.last_wp_index[i]
+            # Guard against NaN positions (e.g. from NaN actions)
+            if np.isnan(projected_s):
+                projected_s = self.last_cumulative_distance[i]
+                new_wp_idx = self.last_wp_index[i]
 
-        #     # --- Checkpoint reward (divide track into NUM_CHECKPOINTS segments) ---
-        #     segment_len = self.raceline_length / self.NUM_CHECKPOINTS
-        #     new_ckpt = int(projected_s / segment_len) % self.NUM_CHECKPOINTS
-        #     if new_ckpt != self.last_checkpoint[i]:
-        #         rewards[i] += self.CHECKPOINT_REWARD
-        #         self.last_checkpoint[i] = new_ckpt
+            # --- Continuous forward-progress reward ---
+            delta_s = projected_s - self.last_cumulative_distance[i]
+            # Handle raceline wrap-around (positive = forward)
+            if delta_s < -self.raceline_length * 0.5:
+                delta_s += self.raceline_length
+            elif delta_s > self.raceline_length * 0.5:
+                delta_s -= self.raceline_length
+            # Only reward forward progress, don't penalise backward (collision resets)
+            if delta_s > 0:
+                rewards[i] += delta_s * self.PROGRESS_REWARD
 
-        #     self.last_cumulative_distance[i] = projected_s
-        #     self.last_wp_index[i] = new_wp_idx
+            # --- Checkpoint reward (divide track into NUM_CHECKPOINTS segments) ---
+            segment_len = self.raceline_length / self.NUM_CHECKPOINTS
+            new_ckpt = int(projected_s / segment_len) % self.NUM_CHECKPOINTS
+            if new_ckpt != self.last_checkpoint[i]:
+                rewards[i] += self.CHECKPOINT_REWARD
+                self.last_checkpoint[i] = new_ckpt
 
-        # --- SPEED BONUS vs GFPP reference ---
+            self.last_cumulative_distance[i] = projected_s
+            self.last_wp_index[i] = new_wp_idx
+
+        # --- SPEED BONUS vs MPC reference ---
         target_speed = self.mpc.get_actions_batch(next_obs)
         speed_bonus = (speeds - target_speed[:self.num_agents, 1]) * self.SPEED_REWARD
         rewards += speed_bonus
@@ -671,6 +771,11 @@ class D2PPOAgent:
         The λ term keeps pure denoising ability from degrading.
 
         The critic uses Huber loss with PPO-style value clipping.
+
+        When ``self.tbtt_length > 0``, observations are re-encoded through
+        the Mamba2 temporal backbone sequentially (TBTT) so gradients flow
+        through the encoder — allowing the Mamba2 to continue learning
+        temporal representations during RL fine-tuning.
         """
         print("Starting AWR-Diffusion learning...")
         print(f"  Buffer size: {len(self.buffer)}")
@@ -686,13 +791,46 @@ class D2PPOAgent:
         with torch.no_grad():
             data = self._compute_gae(data)
 
+        # Dispatch to TBTT or shuffled-minibatch learner
+        if self.tbtt_length > 0:
+            self._learn_tbtt(data, current_gen_diagnostics)
+        else:
+            self._learn_shuffled(data, current_gen_diagnostics)
+
+        # --- Post-training bookkeeping ---
+        self.generation_counter += 1
+        for key in self.diagnostic_keys:
+            values = current_gen_diagnostics.get(key)
+            if values:
+                avg_val = np.mean(values)
+                min_val = np.min(values)
+                max_val = np.max(values)
+                self.diagnostics_history[key].append((avg_val, min_val, max_val))
+
+        if self.generation_counter > 0:
+            self._plot_historical_diagnostics()
+
+        self.buffer.clear()
+        del data
+        torch.cuda.empty_cache()
+        print("[D²PPO Stage 2] Learning complete.")
+
+    # ------------------------------------------------------------------
+    # Shuffled-minibatch learner (original — no encoder gradients)
+    # ------------------------------------------------------------------
+    def _learn_shuffled(self, data, current_gen_diagnostics):
+        """Train on cached obs_features with shuffled minibatches.
+
+        The Mamba2 encoder is frozen (uses rollout-cached features); only
+        the diffusion denoiser and critic value head receive gradients.
+        """
         obs_scan_all = data["observation_scan"]
         obs_state_all = data["observation_state"]
-        obs_features_all = data["obs_features"]  # Cached from rollout (with Mamba2 context)
-        critic_features_all = data["critic_features"]  # Cached critic Mamba2 features
+        obs_features_all = data["obs_features"]
+        critic_features_all = data["critic_features"]
         actions_all = data["action"]
-        raw_advantages_all = data["raw_advantage"]  # Un-normalised for AWR weights
-        advantages_all = data["advantage"]           # Normalised for diagnostics
+        raw_advantages_all = data["raw_advantage"]
+        advantages_all = data["advantage"]
         value_targets_all = data["value_target"]
         old_values_all = data["state_value"]
 
@@ -700,19 +838,12 @@ class D2PPOAgent:
 
         self.actor_network.train()
         self.critic_network.train()
-        
 
-        # Flush stale intermediate features accumulated during rollout.
-        # The diffusion_utils ConditionalDenoisingMLP appends to a list on
-        # every forward pass (including the K denoising steps inside
-        # sample_action_with_chain).  Without this clear, the first
-        # minibatch would receive ~steps*K rollout features alongside its
-        # own, poisoning the dispersive loss.
-        self.actor_network.denoise_net.get_intermediate_features()  # returns & clears
+        self.actor_network.denoise_net.get_intermediate_features()  # flush stale
 
         K = self.num_diffusion_steps
 
-        print(f"  Training: {self.epochs} epochs, {num_timesteps} timesteps, "
+        print(f"  Training (shuffled): {self.epochs} epochs, {num_timesteps} timesteps, "
               f"AWR temp={self.awr_temperature}, diff_reg={self.diff_reg_lambda}")
 
         for epoch in range(self.epochs):
@@ -898,23 +1029,342 @@ class D2PPOAgent:
 
             torch.cuda.empty_cache()
 
-        # --- Post-training bookkeeping ---
-        self.generation_counter += 1
-        for key in self.diagnostic_keys:
-            values = current_gen_diagnostics.get(key)
-            if values:
-                avg_val = np.mean(values)
-                min_val = np.min(values)
-                max_val = np.max(values)
-                self.diagnostics_history[key].append((avg_val, min_val, max_val))
+    # ------------------------------------------------------------------
+    # TBTT learner — re-encodes through Mamba2 with temporal context
+    # ------------------------------------------------------------------
+    def _learn_tbtt(self, data, current_gen_diagnostics):
+        """TBTT variant: re-encode observations through Mamba2 with gradients.
 
-        if self.generation_counter > 0:
-            self._plot_historical_diagnostics()
+        Processes the rollout buffer sequentially so the Mamba2 temporal
+        backbone receives gradient signal, allowing it to continue learning
+        temporal representations (buffer utilisation) during RL fine-tuning.
 
-        self.buffer.clear()
-        del data
-        torch.cuda.empty_cache()
-        print("[D²PPO Stage 2] Learning complete.")
+        Hidden / buffer state is detached at TBTT chunk boundaries to bound
+        the backward graph.  Optional activation checkpointing
+        (``self.checkpoint_every > 0``) trades recomputation for memory.
+        """
+        obs_scan_all = data["observation_scan"].to(self.device)     # (T, A, 1, beams)
+        obs_state_all = data["observation_state"].to(self.device)   # (T, A, state_dim)
+        actions_all = data["action"].to(self.device)                # (T, A, 2)
+        raw_advantages_all = data["raw_advantage"].to(self.device)  # (T, A)
+        value_targets_all = data["value_target"].to(self.device)    # (T, A)
+        old_values_all = data["state_value"].to(self.device)        # (T, A)
+
+        T = len(data)
+        A = self.num_agents
+        K = self.num_diffusion_steps
+        tbtt_len = self.tbtt_length
+        use_ckpt = self.checkpoint_every > 0
+        num_chunks = (T + tbtt_len - 1) // tbtt_len
+
+        # Pre-compute full-buffer statistics for stable normalisation
+        raw_adv_flat = raw_advantages_all.flatten()
+        adv_mean = raw_adv_flat.mean().detach()
+        adv_std = raw_adv_flat.std().clamp(min=1e-8).detach()
+        vt_flat = value_targets_all.flatten()
+        vt_mean_g = vt_flat.mean().detach()
+        vt_std_g = vt_flat.std().clamp(min=1e-4).detach()
+
+        # Flush stale dispersive features from rollout
+        self.actor_network.denoise_net.get_intermediate_features()
+
+        self.actor_network.train()
+        self.critic_network.train()
+
+        # ── Segment function for activation checkpointing ────────────
+        def _rl_segment_fn(actor_buf, critic_buf,
+                           scans_seg, states_seg, actions_seg,
+                           raw_adv_seg, vt_seg, ov_seg):
+            """Process a temporal segment through both encoders + losses."""
+            seg_len = scans_seg.shape[0]
+            s_actor = torch.tensor(0.0, device=scans_seg.device)
+            s_critic = torch.tensor(0.0, device=scans_seg.device)
+            s_diff = torch.tensor(0.0, device=scans_seg.device)
+            s_disp = torch.tensor(0.0, device=scans_seg.device)
+            s_wstd = torch.tensor(0.0, device=scans_seg.device)
+
+            for i in range(seg_len):
+                with torch.amp.autocast("cuda"):
+                    obs_feat, actor_buf = self.actor_network.encode_observation(
+                        scans_seg[i], states_seg[i], actor_buf)
+                    crit_feat, critic_buf = self.critic_network.encode_observation(
+                        scans_seg[i], states_seg[i], critic_buf)
+
+                obs_feat_f = obs_feat.float()
+                crit_feat_f = crit_feat.float()
+
+                # --- Actor AWR loss ---
+                act_norm = self.actor_network.normalize_action(actions_seg[i])
+                t_d = torch.randint(0, K, (act_norm.shape[0],),
+                                    device=scans_seg.device)
+                noise = torch.randn_like(act_norm)
+                noisy = self.actor_network.q_sample(act_norm, t_d, noise=noise)
+                pred = self.actor_network.predict_noise(noisy, obs_feat_f, t_d)
+                mse = ((pred - noise) ** 2).sum(dim=-1)
+
+                adv = (raw_adv_seg[i] - adv_mean) / adv_std
+                w = torch.exp(adv / self.awr_temperature).clamp(
+                    max=self.awr_max_weight)
+                w = w / (w.mean() + 1e-8)
+
+                awr = (w * mse).mean()
+                dr = mse.mean()
+
+                feat_dict = self.actor_network.denoise_net\
+                    .get_intermediate_features()
+                if isinstance(feat_dict, list):
+                    feat_dict = {j: f for j, f in enumerate(feat_dict)}
+                dl = torch.tensor(0.0, device=scans_seg.device)
+                nf = 0
+                for _, feats in feat_dict.items():
+                    if feats.ndim > 2:
+                        feats = feats.mean(
+                            dim=list(range(1, feats.ndim - 1)))
+                    d = dispersive_loss_infonce_l2(
+                        feats, self.dispersive_temperature)
+                    if not torch.isnan(d) and not torch.isinf(d):
+                        dl = dl + d
+                        nf += 1
+                if nf > 0:
+                    dl = dl / nf
+
+                s_actor = s_actor + (
+                    awr + self.diff_reg_lambda * dr
+                    + self.dispersive_lambda * dl)
+                s_diff = s_diff + dr
+                s_disp = s_disp + dl
+                s_wstd = s_wstd + w.std()
+
+                # --- Critic value loss ---
+                pv = self.critic_network.forward_from_features(crit_feat_f)
+                if pv.ndim > 1:
+                    pv = pv.squeeze(-1)
+                pv_n = (pv - vt_mean_g) / vt_std_g
+                vt_n = (vt_seg[i].detach() - vt_mean_g) / vt_std_g
+                ov_n = (ov_seg[i].detach() - vt_mean_g) / vt_std_g
+
+                vc = ov_n + (pv_n - ov_n).clamp(
+                    -self.clip_epsilon, self.clip_epsilon)
+                cl_u = F.smooth_l1_loss(pv_n, vt_n, reduction='none')
+                cl_c = F.smooth_l1_loss(vc, vt_n, reduction='none')
+                s_critic = s_critic + torch.max(cl_u, cl_c).mean()
+
+            return (s_actor, s_critic, s_diff, s_disp, s_wstd,
+                    actor_buf, critic_buf)
+
+        print(f"  Training (TBTT): {self.epochs} epochs, {T} timesteps, "
+              f"chunk={tbtt_len}, {num_chunks} chunks/epoch, "
+              f"ckpt_every={self.checkpoint_every}")
+
+        for epoch in range(self.epochs):
+            # Fresh temporal state each epoch
+            actor_obs_buffer = self.actor_network.create_observation_buffer(
+                A, self.device)
+            critic_obs_buffer = self.critic_network.create_observation_buffer(
+                A, self.device)
+
+            epoch_actor_loss = 0.0
+            epoch_critic_loss = 0.0
+            epoch_diff_loss = 0.0
+            epoch_disp_loss = 0.0
+            num_updates = 0
+
+            for chunk_start in range(0, T, tbtt_len):
+                chunk_end = min(chunk_start + tbtt_len, T)
+                chunk_len = chunk_end - chunk_start
+
+                # Detach temporal state at chunk boundary (truncated BPTT)
+                actor_obs_buffer = actor_obs_buffer.detach()
+                critic_obs_buffer = critic_obs_buffer.detach()
+
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.critic_optimizer.zero_grad(set_to_none=True)
+
+                chunk_actor = torch.tensor(0.0, device=self.device)
+                chunk_critic = torch.tensor(0.0, device=self.device)
+                chunk_diff = torch.tensor(0.0, device=self.device)
+                chunk_disp = torch.tensor(0.0, device=self.device)
+                chunk_wstd = torch.tensor(0.0, device=self.device)
+
+                if use_ckpt:
+                    # --- Activation-checkpointed path ---
+                    for seg_start in range(chunk_start, chunk_end,
+                                           self.checkpoint_every):
+                        seg_end = min(seg_start + self.checkpoint_every,
+                                      chunk_end)
+                        with torch.amp.autocast("cuda"):
+                            (sa, sc, sd, sp, sw,
+                             actor_obs_buffer,
+                             critic_obs_buffer) = torch_checkpoint(
+                                _rl_segment_fn,
+                                actor_obs_buffer, critic_obs_buffer,
+                                obs_scan_all[seg_start:seg_end],
+                                obs_state_all[seg_start:seg_end],
+                                actions_all[seg_start:seg_end],
+                                raw_advantages_all[seg_start:seg_end],
+                                value_targets_all[seg_start:seg_end],
+                                old_values_all[seg_start:seg_end],
+                                use_reentrant=False,
+                                preserve_rng_state=True,
+                            )
+                        chunk_actor = chunk_actor + sa
+                        chunk_critic = chunk_critic + sc
+                        chunk_diff = chunk_diff + sd
+                        chunk_disp = chunk_disp + sp
+                        chunk_wstd = chunk_wstd + sw
+                else:
+                    # --- Standard (non-checkpointed) path ---
+                    with torch.amp.autocast("cuda"):
+                        for t_idx in range(chunk_start, chunk_end):
+                            obs_feat, actor_obs_buffer = \
+                                self.actor_network.encode_observation(
+                                    obs_scan_all[t_idx],
+                                    obs_state_all[t_idx],
+                                    actor_obs_buffer,
+                                )
+                            crit_feat, critic_obs_buffer = \
+                                self.critic_network.encode_observation(
+                                    obs_scan_all[t_idx],
+                                    obs_state_all[t_idx],
+                                    critic_obs_buffer,
+                                )
+
+                            obs_feat_f = obs_feat.float()
+                            crit_feat_f = crit_feat.float()
+
+                            # Actor AWR loss
+                            act_norm = self.actor_network.normalize_action(
+                                actions_all[t_idx])
+                            t_d = torch.randint(
+                                0, K, (A,), device=self.device)
+                            noise = torch.randn_like(act_norm)
+                            noisy = self.actor_network.q_sample(
+                                act_norm, t_d, noise=noise)
+                            pred = self.actor_network.predict_noise(
+                                noisy, obs_feat_f, t_d)
+                            mse = ((pred - noise) ** 2).sum(dim=-1)
+
+                            adv = (raw_advantages_all[t_idx] - adv_mean) \
+                                / adv_std
+                            w = torch.exp(
+                                adv / self.awr_temperature
+                            ).clamp(max=self.awr_max_weight)
+                            w = w / (w.mean() + 1e-8)
+
+                            chunk_actor = chunk_actor + (
+                                (w * mse).mean()
+                                + self.diff_reg_lambda * mse.mean()
+                            )
+                            chunk_diff = chunk_diff + mse.mean()
+                            chunk_wstd = chunk_wstd + w.std()
+
+                            # Dispersive loss
+                            feat_dict = self.actor_network.denoise_net\
+                                .get_intermediate_features()
+                            if isinstance(feat_dict, list):
+                                feat_dict = {
+                                    j: f for j, f in enumerate(feat_dict)}
+                            dl = torch.tensor(0.0, device=self.device)
+                            nf = 0
+                            for _, feats in feat_dict.items():
+                                if feats.ndim > 2:
+                                    feats = feats.mean(
+                                        dim=list(range(
+                                            1, feats.ndim - 1)))
+                                d = dispersive_loss_infonce_l2(
+                                    feats, self.dispersive_temperature)
+                                if not (torch.isnan(d) or torch.isinf(d)):
+                                    dl = dl + d
+                                    nf += 1
+                            if nf > 0:
+                                dl = dl / nf
+                            chunk_actor = chunk_actor + (
+                                self.dispersive_lambda * dl)
+                            chunk_disp = chunk_disp + dl
+
+                            # Critic value loss
+                            pv = self.critic_network\
+                                .forward_from_features(crit_feat_f)
+                            if pv.ndim > 1:
+                                pv = pv.squeeze(-1)
+                            pv_n = (pv - vt_mean_g) / vt_std_g
+                            vt_n = (value_targets_all[t_idx].detach()
+                                    - vt_mean_g) / vt_std_g
+                            ov_n = (old_values_all[t_idx].detach()
+                                    - vt_mean_g) / vt_std_g
+                            vc = ov_n + (pv_n - ov_n).clamp(
+                                -self.clip_epsilon, self.clip_epsilon)
+                            cl_u = F.smooth_l1_loss(
+                                pv_n, vt_n, reduction='none')
+                            cl_c = F.smooth_l1_loss(
+                                vc, vt_n, reduction='none')
+                            chunk_critic = chunk_critic + torch.max(
+                                cl_u, cl_c).mean()
+
+                # Average over timesteps in chunk
+                avg_actor = chunk_actor / chunk_len
+                avg_critic = chunk_critic / chunk_len
+
+                # Backward & update — actor first, then free its graph
+                # before building the critic graph.  This halves peak
+                # activation memory vs. holding both simultaneously.
+                self.actor_scaler.scale(avg_actor).backward(
+                    retain_graph=False)
+                self.actor_scaler.unscale_(self.actor_optimizer)
+                nn.utils.clip_grad_norm_(
+                    self.actor_network.parameters(),
+                    self.max_grad_norm_actor,
+                )
+                self.actor_scaler.step(self.actor_optimizer)
+                self.actor_scaler.update()
+                avg_actor_val = avg_actor.item()
+                del avg_actor, chunk_actor  # free actor graph memory
+
+                self.critic_scaler.scale(avg_critic).backward()
+                self.critic_scaler.unscale_(self.critic_optimizer)
+                nn.utils.clip_grad_norm_(
+                    self.critic_network.parameters(),
+                    self.max_grad_norm_critic,
+                )
+                self.critic_scaler.step(self.critic_optimizer)
+                self.critic_scaler.update()
+                avg_critic_val = avg_critic.item()
+                avg_diff_val = (chunk_diff / chunk_len).item()
+                avg_disp_val = (chunk_disp / chunk_len).item()
+                avg_wstd_val = (chunk_wstd / chunk_len).item()
+                del avg_critic, chunk_critic  # free critic graph memory
+
+                # Diagnostics
+                epoch_actor_loss += avg_actor_val
+                epoch_critic_loss += avg_critic_val
+                epoch_diff_loss += avg_diff_val
+                epoch_disp_loss += avg_disp_val
+                num_updates += 1
+
+                current_gen_diagnostics["loss_actor"].append(
+                    avg_actor_val)
+                current_gen_diagnostics["loss_critic"].append(
+                    avg_critic_val)
+                current_gen_diagnostics["loss_diffusion"].append(
+                    avg_diff_val)
+                current_gen_diagnostics["loss_dispersive"].append(
+                    avg_disp_val)
+                current_gen_diagnostics["adv_weight_std"].append(
+                    avg_wstd_val)
+                current_gen_diagnostics["avg_speed"].append(
+                    float(obs_state_all[chunk_start:chunk_end, :, 0]
+                          .mean().cpu()))
+
+            if num_updates > 0:
+                print(
+                    f"  Epoch {epoch+1}/{self.epochs}: "
+                    f"Actor={epoch_actor_loss/num_updates:.4f}, "
+                    f"Critic={epoch_critic_loss/num_updates:.4f}, "
+                    f"Diff={epoch_diff_loss/num_updates:.4f}, "
+                    f"Disp={epoch_disp_loss/num_updates:.4f}, "
+                )
+
+            torch.cuda.empty_cache()
 
     def _plot_historical_diagnostics(self):
         keys_to_plot = [
@@ -981,12 +1431,14 @@ class D2PPOAgent:
             values = values.unsqueeze(-1)
             next_values = next_values.unsqueeze(-1)
 
-        # Normalise rewards by std (matches pretrain_critic preprocessing).
-        # Without this the raw reward scale (~15/step) produces value targets
-        # in the hundreds/thousands, far exceeding the pretrained critic's
-        # calibration range and causing enormous, unstable loss.
-        r_std = rewards.std().clamp(min=1e-4)
-        rewards = rewards / r_std
+        # Running reward normalisation (EMA) — smooths across map transitions
+        # instead of per-generation std which spikes at boundaries.
+        batch_mean = rewards.mean().item()
+        batch_var = rewards.var().item()
+        self._reward_ema_mean = 0.99 * self._reward_ema_mean + 0.01 * batch_mean
+        self._reward_ema_var = 0.99 * self._reward_ema_var + 0.01 * batch_var
+        r_std = max(self._reward_ema_var ** 0.5, 1e-4)
+        rewards = (rewards - self._reward_ema_mean) / r_std
 
         timesteps = rewards.shape[0]
         num_agents = rewards.shape[1] if rewards.ndim == 2 else 1

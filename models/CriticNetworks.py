@@ -218,6 +218,7 @@ class Mamba2CriticNetwork(nn.Module):
         d_head=16,
         expand=2,
         memory_length=48,
+        memory_stride=1,
         odom_expand=64,
         num_scan_beams=1080,
     ):
@@ -229,6 +230,8 @@ class Mamba2CriticNetwork(nn.Module):
         
         # Memory configuration
         self.memory_length = memory_length
+        self.memory_stride = memory_stride
+        self.step_counter = 0
         self.d_model = d_model
         
         # Odom handling — baked-in normalisation ranges
@@ -248,10 +251,10 @@ class Mamba2CriticNetwork(nn.Module):
         # Feature projection (CNN+odom → d_model)
         feature_input_size = conv_output_size + odom_expand
         self.feature_projection = nn.Sequential(
-            nn.Linear(feature_input_size, 768),
+            nn.Linear(feature_input_size, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(768, d_model),
+            nn.Linear(256, d_model),
             nn.ReLU(),
         )
 
@@ -277,6 +280,7 @@ class Mamba2CriticNetwork(nn.Module):
     
     def create_observation_buffer(self, batch_size, device):
         """Create a buffer to store recent observations for Mamba input."""
+        self.step_counter = 0
         return torch.zeros(batch_size, self.memory_length, self.d_model, device=device)
 
     def encode_observation(self, scan_tensor, state_tensor, obs_buffer):
@@ -305,11 +309,16 @@ class Mamba2CriticNetwork(nn.Module):
         combined = torch.cat([vision_features, state_feat], dim=-1)
         projected = self.feature_projection(combined)
 
-        # Rolling buffer update
-        obs_buffer = torch.cat([
-            obs_buffer[:, 1:, :],
-            projected.unsqueeze(1),
-        ], dim=1)
+        # Rolling buffer update (stride-aware)
+        self.step_counter += 1
+        if self.memory_stride <= 1 or self.step_counter % self.memory_stride == 0:
+            obs_buffer = torch.cat([
+                obs_buffer[:, 1:, :],
+                projected.unsqueeze(1),
+            ], dim=1)
+        else:
+            obs_buffer = obs_buffer.clone()
+            obs_buffer[:, -1, :] = projected
 
         # Mamba2 temporal pass
         obs_normed = self.pre_mamba_norm(obs_buffer)

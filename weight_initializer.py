@@ -140,6 +140,8 @@ def _collect_single_map(
         actions = expert.get_actions_batch(obs)  # (N, 2)
         noise_actions = noise_agents.get_actions_batch(obs)
         actions[num_agents:] = noise_actions[:num_noise_agents]  # Add noise agents at the end
+        # Last 3 noise agents act as static obstacles (zero steering & velocity)
+        actions[-3:] = np.array([0.0, 0.0])
         
         next_obs, _, _, _ = env.step(actions)
 
@@ -248,7 +250,9 @@ def pretrain(
     demos: list[dict],
     model_type: str = "lstm",
     epochs: int = 100,
-    batch_size: int = 256,
+    tbtt_length: int = 64,
+    checkpoint_every: int = 0,
+    traj_batch_size: int = 8,
     lr: float = 3e-4,
     dispersive_lambda: float = 0.5,
     dispersive_temperature: float = 0.5,
@@ -259,14 +263,32 @@ def pretrain(
     device: str | torch.device = "cuda",
 ):
     """
-    Train a fresh DiffusionLSTM or DiffusionMamba2 on the collected demonstrations.
+    Train a fresh DiffusionLSTM or DiffusionMamba2 on the collected demonstrations
+    using Truncated Backpropagation Through Time (TBTT).
 
     The loss is the standard DDPM noise-prediction MSE (L_diff) plus
     dispersive regularisation on intermediate denoise-MLP features (L_disp).
+
+    Demos are grouped into trajectories by (map, agent) and processed
+    sequentially in chunks of ``tbtt_length``, with hidden states detached
+    at chunk boundaries to truncate gradient flow.
+
+    When ``checkpoint_every > 0``, activation checkpointing is used within
+    each TBTT window: the window is split into segments of
+    ``checkpoint_every`` steps and ``torch.utils.checkpoint`` recomputes
+    activations during backward instead of storing them.  Gradients still
+    flow across the **entire** TBTT window (hidden states are NOT detached
+    between checkpoint segments) — only the TBTT boundary performs
+    detachment.  This lets you set a very large ``tbtt_length`` (e.g. 7000)
+    while keeping peak memory proportional to ``checkpoint_every``.
     """
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"\n[Pretrain] Device: {device}")
-    print(f"[Pretrain] {len(demos)} demos, {epochs} epochs, batch_size={batch_size}, lr={lr}")
+    ckpt_str = f", checkpoint_every={checkpoint_every}" if checkpoint_every > 0 else ""
+    print(f"[Pretrain] {len(demos)} demos, {epochs} epochs, tbtt={tbtt_length}, "
+          f"traj_batch={traj_batch_size}{ckpt_str}, lr={lr}")
 
     # ── Build model ──────────────────────────────────────────────────
     if model_type == "lstm":
@@ -276,7 +298,7 @@ def pretrain(
                     num_diffusion_steps=num_diffusion_steps,
                     inference_steps=5,          # DDIM fast sampling for rollout/deploy
                     time_emb_dim=32,
-                    hidden_dims=(256, 256),
+                    hidden_dims=(128, 128),
                     beta_schedule="cosine",
                     odom_expand=32,
                     proj_hidden=384,
@@ -293,7 +315,7 @@ def pretrain(
                     inference_steps=5,          # DDIM fast sampling for rollout/deploy
                     obs_feature_dim=64,
                     time_emb_dim=32,
-                    hidden_dims=(256, 256),
+                    hidden_dims=(128, 128),
                     beta_schedule="cosine",
                     d_model=64,
                     d_state=16,
@@ -313,89 +335,211 @@ def pretrain(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # ── Materialise tensors (keep on GPU to avoid per-batch transfers) ─
-    all_scans   = torch.stack([torch.from_numpy(d["scan"])   for d in demos]).unsqueeze(1).to(device)  # (N, 1, 1080)
-    all_states  = torch.stack([torch.from_numpy(d["state"])  for d in demos]).to(device)               # (N, 4)
-    all_actions = torch.stack([torch.from_numpy(d["action"]) for d in demos]).to(device)               # (N, 2)
-    
-    N = len(demos)
-    print(f"[Pretrain] Tensors ready — scans {tuple(all_scans.shape)}, "
-          f"states {tuple(all_states.shape)}, actions {tuple(all_actions.shape)}")
+    # ── Build trajectory tensors for TBTT ────────────────────────────
+    from collections import defaultdict
+    traj_dict = defaultdict(list)
+    for d in demos:
+        key = (d["map"], d.get("agent", 0))
+        traj_dict[key].append(d)
+    for key in traj_dict:
+        traj_dict[key].sort(key=lambda x: x.get("step", 0))
 
-    # ── Training ─────────────────────────────────────────────────────
+    traj_data = []  # list of (scans_T, states_T, actions_T) per trajectory
+    for key, traj in traj_dict.items():
+        if len(traj) < 10:
+            continue
+        scans  = torch.stack([torch.from_numpy(d["scan"]) for d in traj]).unsqueeze(1).to(device)
+        states = torch.stack([torch.from_numpy(d["state"]) for d in traj]).to(device)
+        actions = torch.stack([torch.from_numpy(d["action"]) for d in traj]).to(device)
+        traj_data.append((scans, states, actions))
+
+    num_trajs = len(traj_data)
+    total_steps = sum(t[0].shape[0] for t in traj_data)
+    print(f"[Pretrain] {num_trajs} trajectories, {total_steps} total steps, "
+          f"TBTT length={tbtt_length}, traj_batch={traj_batch_size}")
+
+    # ── Helper: process a segment of timesteps (used by checkpoint) ──
+    def _actor_segment_fn(obs_buffer, hidden_h, hidden_c,
+                          scans_seg, states_seg, actions_seg):
+        """Forward through a segment, returning (diff, disp, obs_buffer, h, c).
+        Captured from closure: model, model_type, dispersive_temperature."""
+        seg_len = scans_seg.shape[0]
+        seg_diff = torch.tensor(0.0, device=device)
+        seg_disp = torch.tensor(0.0, device=device)
+        for t in range(seg_len):
+            if model_type == "lstm":
+                obs_feat, obs_buffer, hidden_h, hidden_c = \
+                    model.encode_observation(
+                        scans_seg[t], states_seg[t], obs_buffer,
+                        hidden_h, hidden_c,
+                    )
+            else:
+                obs_feat, obs_buffer = model.encode_observation(
+                    scans_seg[t], states_seg[t], obs_buffer,
+                )
+            seg_diff = seg_diff + model.compute_diffusion_loss(
+                actions_seg[t], obs_feat)
+            feat_list = model.denoise_net.get_intermediate_features()
+            step_disp = torch.tensor(0.0, device=device)
+            if feat_list:
+                for feats in feat_list:
+                    if feats.ndim > 2:
+                        feats = feats.mean(
+                            dim=list(range(1, feats.ndim - 1)))
+                    step_disp = step_disp + dispersive_loss_infonce_l2(
+                        feats, dispersive_temperature)
+                step_disp = step_disp / len(feat_list)
+            seg_disp = seg_disp + step_disp
+        return seg_diff, seg_disp, obs_buffer, hidden_h, hidden_c
+
+    use_ckpt = checkpoint_every > 0
+
+    # ── Training with TBTT ───────────────────────────────────────────
     os.makedirs(save_dir, exist_ok=True)
     best_loss = float("inf")
     torch.backends.cudnn.benchmark = True
 
     for epoch in range(1, epochs + 1):
         model.train()
-        perm = torch.randperm(N)
+        traj_order = torch.randperm(num_trajs).tolist()
         epoch_diff = 0.0
         epoch_disp = 0.0
-        num_batches = 0
+        epoch_steps = 0
+        chunk_count = 0
         optimizer.zero_grad(set_to_none=True)
 
-        for start in range(0, N, batch_size):
-            idx = perm[start : start + batch_size]
-            scan_b   = all_scans[idx]
-            state_b  = all_states[idx]
-            action_b = all_actions[idx]
-            B = scan_b.shape[0]
+        for tb_start in range(0, num_trajs, traj_batch_size):
+            tb_indices = traj_order[tb_start:tb_start + traj_batch_size]
+            B = len(tb_indices)
+            batch_trajs = [traj_data[i] for i in tb_indices]
+            T = min(t[0].shape[0] for t in batch_trajs)
 
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                # Encode observations (no temporal continuity for shuffled batches)
+            # Stack trajectories into time-first layout: (T, B, ...)
+            scans_tb  = torch.stack([sc[:T] for sc, _, _ in batch_trajs], dim=1)
+            states_tb = torch.stack([st[:T] for _, st, _ in batch_trajs], dim=1)
+            actions_tb = torch.stack([ac[:T] for _, _, ac in batch_trajs], dim=1)
+
+            # Initialise temporal state for this trajectory batch
+            if model_type == "lstm":
+                hidden_h, hidden_c = model.get_init_hidden(B, device, transpose=True)
+            else:
+                hidden_h = torch.empty(0, device=device)
+                hidden_c = torch.empty(0, device=device)
+            obs_buffer = model.create_observation_buffer(B, device)
+
+            # TBTT: process in chunks, detaching hidden state at boundaries
+            for chunk_start in range(0, T, tbtt_length):
+                chunk_end = min(chunk_start + tbtt_length, T)
+
+                # Truncate backprop by detaching carried state
                 if model_type == "lstm":
-                    obs_features, _, _, _ = model.encode_observation(
-                        scan_b, state_b, obs_buffer=None, hidden_h=None, hidden_c=None,
-                    )
+                    hidden_h = hidden_h.detach()
+                    hidden_c = hidden_c.detach()
+                obs_buffer = obs_buffer.detach()
+
+                chunk_diff = torch.tensor(0.0, device=device)
+                chunk_disp = torch.tensor(0.0, device=device)
+                chunk_len = chunk_end - chunk_start
+
+                if use_ckpt:
+                    # ── Activation-checkpointed path ────────────────
+                    # Split TBTT window into small segments; gradient
+                    # flows across the full window but activations are
+                    # recomputed per segment during backward.
+                    for seg_start in range(chunk_start, chunk_end,
+                                          checkpoint_every):
+                        seg_end = min(seg_start + checkpoint_every,
+                                      chunk_end)
+                        scans_seg   = scans_tb[seg_start:seg_end]
+                        states_seg  = states_tb[seg_start:seg_end]
+                        actions_seg = actions_tb[seg_start:seg_end]
+
+                        with torch.amp.autocast("cuda",
+                                    enabled=(device.type == "cuda")):
+                            sd, sp, obs_buffer, hidden_h, hidden_c = \
+                                torch_checkpoint(
+                                    _actor_segment_fn,
+                                    obs_buffer, hidden_h, hidden_c,
+                                    scans_seg, states_seg, actions_seg,
+                                    use_reentrant=False,
+                                    preserve_rng_state=True,
+                                )
+                        chunk_diff = chunk_diff + sd
+                        chunk_disp = chunk_disp + sp
                 else:
-                    obs_features, _ = model.encode_observation(
-                        scan_b, state_b, obs_buffer=None,
-                    )
+                    # ── Standard (non-checkpointed) path ────────────
+                    with torch.amp.autocast("cuda",
+                                enabled=(device.type == "cuda")):
+                        for t in range(chunk_start, chunk_end):
+                            if model_type == "lstm":
+                                obs_feat, obs_buffer, hidden_h, \
+                                    hidden_c = \
+                                    model.encode_observation(
+                                        scans_tb[t], states_tb[t],
+                                        obs_buffer, hidden_h, hidden_c,
+                                    )
+                            else:
+                                obs_feat, obs_buffer = \
+                                    model.encode_observation(
+                                        scans_tb[t], states_tb[t],
+                                        obs_buffer,
+                                    )
+                            diff_loss = model.compute_diffusion_loss(
+                                actions_tb[t], obs_feat)
+                            feat_list = model.denoise_net \
+                                .get_intermediate_features()
+                            disp_loss = torch.tensor(0.0, device=device)
+                            if feat_list:
+                                for feats in feat_list:
+                                    if feats.ndim > 2:
+                                        feats = feats.mean(
+                                            dim=list(range(
+                                                1, feats.ndim - 1)))
+                                    disp_loss = disp_loss + \
+                                        dispersive_loss_infonce_l2(
+                                            feats,
+                                            dispersive_temperature)
+                                disp_loss = disp_loss / len(feat_list)
+                            chunk_diff = chunk_diff + diff_loss
+                            chunk_disp = chunk_disp + disp_loss
 
-                # ── Diffusion loss (noise prediction MSE) ───────────
-                # compute_diffusion_loss normalises actions internally.
-                # The dispersive hooks on denoise_net capture intermediate
-                # features from this forward pass — no need for a second one.
-                diff_loss = model.compute_diffusion_loss(action_b, obs_features)
+                # Average over timesteps in chunk, scale for grad accumulation
+                avg_chunk_loss = (
+                    chunk_diff + dispersive_lambda * chunk_disp) / chunk_len
+                scaler.scale(
+                    avg_chunk_loss / gradient_accumulation_steps).backward()
 
-                # ── Dispersive loss on intermediate features ────────
-                # Hooks were triggered by compute_diffusion_loss above
-                feat_list = model.denoise_net.get_intermediate_features()
-                disp_loss = torch.tensor(0.0, device=device)
-                if feat_list:
-                    for feats in feat_list:
-                        if feats.ndim > 2:
-                            feats = feats.mean(dim=list(range(1, feats.ndim - 1)))
-                        disp_loss = disp_loss + dispersive_loss_infonce_l2(feats, dispersive_temperature)
-                    disp_loss = disp_loss / len(feat_list)
+                chunk_count += 1
+                if chunk_count % gradient_accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
-                loss = (diff_loss + dispersive_lambda * disp_loss) / gradient_accumulation_steps
+                epoch_diff += chunk_diff.item()
+                epoch_disp += chunk_disp.item()
+                epoch_steps += chunk_len
 
-            scaler.scale(loss).backward()
+            # Progress
+            pct = min(tb_start + traj_batch_size, num_trajs) / num_trajs * 100
+            n_tb = (num_trajs + traj_batch_size - 1) // traj_batch_size
+            print(f"    [Epoch {epoch}/{epochs}] Traj batch "
+                  f"{tb_start // traj_batch_size + 1}/{n_tb} "
+                  f"({pct:.1f}%)", end="\r", flush=True)
 
-            # Gradient accumulation step
-            if (num_batches + 1) % gradient_accumulation_steps == 0 or (start + batch_size >= N):
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+        # Flush remaining accumulated gradients
+        if chunk_count % gradient_accumulation_steps != 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-            epoch_diff += diff_loss.item() * B
-            epoch_disp += disp_loss.item() * B
-            num_batches += 1
-            
-            # Progress marker
-            if num_batches % 5 == 0:
-                pct = min(start + batch_size, N) / N * 100
-                print(f"    [Epoch {epoch}/{epochs}] Batch {num_batches} "
-                      f"({pct:.1f}%)  diff={diff_loss.item():.5f}  disp={disp_loss.item():.5f}",
-                      end="\r", flush=True)
         scheduler.step()
 
-        avg_diff = epoch_diff / N
-        avg_disp = epoch_disp / N
+        avg_diff = epoch_diff / max(epoch_steps, 1)
+        avg_disp = epoch_disp / max(epoch_steps, 1)
         avg_total = avg_diff + dispersive_lambda * avg_disp
 
         # Checkpoint best
@@ -433,7 +577,9 @@ def pretrain_critic(
     actor_state_dict: dict,
     model_type: str = "lstm",
     epochs: int = 30,
-    batch_size: int = 256,
+    tbtt_length: int = 64,
+    checkpoint_every: int = 0,
+    traj_batch_size: int = 8,
     lr: float = 5e-4,
     gamma: float = 0.999,
     speed_reward_scale: float = 0.10,
@@ -465,7 +611,9 @@ def pretrain_critic(
     print(f"\n{'=' * 60}")
     print("  CRITIC PRE-TRAINING  (weight_initializer)")
     print(f"{'=' * 60}")
-    print(f"  {len(demos)} demos, {epochs} epochs, {batch_size} batch, "
+    print(f"  {len(demos)} demos, {epochs} epochs, tbtt={tbtt_length}, "
+          f"traj_batch={traj_batch_size}, "
+          f"{'ckpt=' + str(checkpoint_every) + ', ' if checkpoint_every > 0 else ''}"
           f"lr={lr}, γ={gamma}")
 
     has_reward_fields = ("next_velocity" in demos[0])
@@ -536,17 +684,15 @@ def pretrain_critic(
     for key in trajectories:
         trajectories[key].sort(key=lambda x: x.get("step", 0))
 
-    all_scans = []
-    all_states = []
-    all_returns = []
+    traj_data_c = []  # list of (scans, states, returns) per trajectory
 
     for (map_name, agent_idx), traj in trajectories.items():
         T = len(traj)
         if T < 10:
             continue
 
-        scans  = torch.stack([torch.from_numpy(d["scan"]) for d in traj]).unsqueeze(1)
-        states = torch.stack([torch.from_numpy(d["state"]) for d in traj])
+        scans  = torch.stack([torch.from_numpy(d["scan"]) for d in traj]).unsqueeze(1).to(device)
+        states = torch.stack([torch.from_numpy(d["state"]) for d in traj]).to(device)
 
         # Compute per-step rewards
         rewards = torch.zeros(T)
@@ -570,17 +716,39 @@ def pretrain_critic(
             G = rewards[t] + gamma * G
             returns[t] = G
 
-        all_scans.append(scans)
-        all_states.append(states)
-        all_returns.append(returns)
+        traj_data_c.append((scans, states, returns.to(device)))
 
-    X_scans  = torch.cat(all_scans,  dim=0).to(device)
-    X_states = torch.cat(all_states, dim=0).to(device)
-    Y_returns = torch.cat(all_returns, dim=0).to(device)
-    N = X_scans.shape[0]
-    print(f"  Reconstructed {len(trajectories)} trajectories → {N} samples")
+    num_trajs_c = len(traj_data_c)
+    total_steps_c = sum(t[0].shape[0] for t in traj_data_c)
+    print(f"  {num_trajs_c} trajectories, {total_steps_c} steps, "
+          f"TBTT length={tbtt_length}, traj_batch={traj_batch_size}")
 
-    # ── 3. Supervised training ───────────────────────────────────────
+    # ── 3. TBTT training ────────────────────────────────────────────
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+    def _critic_segment_fn(obs_buffer, hidden_h, hidden_c,
+                           scans_seg, states_seg, returns_seg):
+        """Forward through a critic segment.
+        Captured from closure: critic, model_type."""
+        seg_len = scans_seg.shape[0]
+        seg_loss = torch.tensor(0.0, device=scans_seg.device)
+        for t in range(seg_len):
+            if model_type == "lstm":
+                feat, obs_buffer, hidden_h, hidden_c = \
+                    critic.encode_observation(
+                        scans_seg[t], states_seg[t], obs_buffer,
+                        hidden_h, hidden_c,
+                    )
+            else:
+                feat, obs_buffer = critic.encode_observation(
+                    scans_seg[t], states_seg[t], obs_buffer,
+                )
+            pred = critic.fc_layers(feat).squeeze(-1)
+            seg_loss = seg_loss + F.smooth_l1_loss(pred, returns_seg[t])
+        return seg_loss, obs_buffer, hidden_h, hidden_c
+
+    use_ckpt = checkpoint_every > 0
+
     critic.train()
     optim_c = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, critic.parameters()),
@@ -591,33 +759,83 @@ def pretrain_critic(
     os.makedirs(save_dir, exist_ok=True)
 
     for epoch in range(1, epochs + 1):
-        perm = torch.randperm(N, device=device)
+        traj_order = torch.randperm(num_trajs_c).tolist()
         epoch_loss = 0.0
-        n_batches = 0
+        epoch_steps = 0
 
-        for i in range(0, N, batch_size):
-            idx = perm[i:i + batch_size]
-            s  = X_scans[idx]
-            st = X_states[idx]
-            y  = Y_returns[idx]
+        for tb_start in range(0, num_trajs_c, traj_batch_size):
+            tb_indices = traj_order[tb_start:tb_start + traj_batch_size]
+            B = len(tb_indices)
+            batch_trajs = [traj_data_c[i] for i in tb_indices]
+            T = min(t[0].shape[0] for t in batch_trajs)
 
+            # Stack into time-first layout
+            scans_tb   = torch.stack([sc[:T] for sc, _, _ in batch_trajs], dim=1)
+            states_tb  = torch.stack([st[:T] for _, st, _ in batch_trajs], dim=1)
+            returns_tb = torch.stack([ret[:T] for _, _, ret in batch_trajs], dim=1)
+
+            # Initialise temporal state
             if model_type == "lstm":
-                feat, _, _, _ = critic.encode_observation(s, st, obs_buffer=None)
+                hidden_h, hidden_c = critic.get_init_hidden(B, device, transpose=True)
             else:
-                feat, _ = critic.encode_observation(s, st, obs_buffer=None)
-            
-            pred = critic.fc_layers(feat).squeeze(-1)
-            loss = F.smooth_l1_loss(pred, y)
+                hidden_h = torch.empty(0, device=device)
+                hidden_c = torch.empty(0, device=device)
+            obs_buffer = critic.create_observation_buffer(B, device)
 
-            optim_c.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-            optim_c.step()
+            # Process in TBTT chunks
+            for chunk_start in range(0, T, tbtt_length):
+                chunk_end = min(chunk_start + tbtt_length, T)
 
-            epoch_loss += loss.item()
-            n_batches += 1
+                if model_type == "lstm":
+                    hidden_h = hidden_h.detach()
+                    hidden_c = hidden_c.detach()
+                obs_buffer = obs_buffer.detach()
 
-        avg = epoch_loss / max(n_batches, 1)
+                chunk_loss = torch.tensor(0.0, device=device)
+                chunk_len = chunk_end - chunk_start
+
+                if use_ckpt:
+                    for seg_start in range(chunk_start, chunk_end,
+                                          checkpoint_every):
+                        seg_end = min(seg_start + checkpoint_every,
+                                      chunk_end)
+                        sl, obs_buffer, hidden_h, hidden_c = \
+                            torch_checkpoint(
+                                _critic_segment_fn,
+                                obs_buffer, hidden_h, hidden_c,
+                                scans_tb[seg_start:seg_end],
+                                states_tb[seg_start:seg_end],
+                                returns_tb[seg_start:seg_end],
+                                use_reentrant=False,
+                                preserve_rng_state=True,
+                            )
+                        chunk_loss = chunk_loss + sl
+                else:
+                    for t in range(chunk_start, chunk_end):
+                        if model_type == "lstm":
+                            feat, obs_buffer, hidden_h, hidden_c = \
+                                critic.encode_observation(
+                                    scans_tb[t], states_tb[t],
+                                    obs_buffer, hidden_h, hidden_c,
+                                )
+                        else:
+                            feat, obs_buffer = critic.encode_observation(
+                                scans_tb[t], states_tb[t], obs_buffer,
+                            )
+                        pred = critic.fc_layers(feat).squeeze(-1)
+                        chunk_loss = chunk_loss + F.smooth_l1_loss(
+                            pred, returns_tb[t])
+
+                avg_loss = chunk_loss / chunk_len
+                optim_c.zero_grad(set_to_none=True)
+                avg_loss.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                optim_c.step()
+
+                epoch_loss += chunk_loss.item()
+                epoch_steps += chunk_len
+
+        avg = epoch_loss / max(epoch_steps, 1)
         if avg < best_loss:
             best_loss = avg
             torch.save(critic.state_dict(), os.path.join(save_dir, save_name))
@@ -652,9 +870,9 @@ def main():
     # Demo collection
     parser.add_argument("--maps", nargs="+", default=ALL_MAPS,
                         help="Maps to collect demos on (default: all)")
-    parser.add_argument("--num_agents", type=int, default=4,
+    parser.add_argument("--num_agents", type=int, default=2,
                         help="Agents per env during collection")
-    parser.add_argument("--steps_per_map", type=int, default=3000,
+    parser.add_argument("--steps_per_map", type=int, default=7000,
                         help="Env steps per map during collection")
     parser.add_argument("--max_workers", type=int, default=None,
                         help="Parallel processes for demo collection (default: min(num_maps, cpu_count))")
@@ -666,11 +884,17 @@ def main():
     parser.add_argument("--model_type", type=str, default="lstm", choices=["lstm", "mamba2"],
                         help="Network architecture backbone (lstm or mamba2)")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--tbtt_length", type=int, default=512,
+                        help="TBTT truncation window length")
+    parser.add_argument("--checkpoint_every", type=int, default=0,
+                        help="Activation checkpoint segment size inside TBTT window "
+                             "(0=off, e.g. 64 for memory saving with large tbtt_length)")
+    parser.add_argument("--traj_batch_size", type=int, default=2,
+                        help="Number of trajectories to process in parallel")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--dispersive_lambda", type=float, default=0.5)
     parser.add_argument("--num_diffusion_steps", type=int, default=10)
-    parser.add_argument("--gradient_accumulation", type=int, default=2)
+    parser.add_argument("--gradient_accumulation", type=int, default=1)
     # Actor output
     parser.add_argument("--save_dir", type=str, default="models/actor/pretrained")
     parser.add_argument("--save_name", type=str, default="actor_pretrained.pt")
@@ -706,7 +930,9 @@ def main():
         demos=demos,
         model_type=args.model_type,
         epochs=args.epochs,
-        batch_size=args.batch_size,
+        tbtt_length=args.tbtt_length,
+        checkpoint_every=args.checkpoint_every,
+        traj_batch_size=args.traj_batch_size,
         lr=args.lr,
         dispersive_lambda=args.dispersive_lambda,
         num_diffusion_steps=args.num_diffusion_steps,
@@ -747,7 +973,9 @@ def main():
             actor_state_dict=actor_sd,
             model_type=args.model_type,
             epochs=args.critic_epochs,
-            batch_size=args.batch_size,
+            tbtt_length=args.tbtt_length,
+            checkpoint_every=args.checkpoint_every,
+            traj_batch_size=args.traj_batch_size,
             lr=args.critic_lr,
             save_dir=args.critic_save_dir,
             save_name=args.critic_save_name,

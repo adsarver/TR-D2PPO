@@ -190,27 +190,26 @@ class VisionEncoder(nn.Module):
         # Input shape: (batch_size, 1, num_scan_beams)
         # Based off of TinyLidarNet from: https://arxiv.org/pdf/2410.07447
         # Added dropout for cross-track generalization
+        # No per-layer normalization — input is already fixed-range [0,1]
+        # via clamp(0,10)/10 in encode_observation; GroupNorm(1,C) was
+        # destroying absolute distance information (per-frame re-centering).
         self.conv_layers = nn.Sequential(
             nn.Conv1d(in_channels=1, out_channels=24, kernel_size=10, stride=4),
-            nn.GroupNorm(1, 24),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Conv1d(in_channels=24, out_channels=36, kernel_size=8, stride=4),
-            nn.GroupNorm(1, 36),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Conv1d(in_channels=36, out_channels=48, kernel_size=4, stride=2),
-            nn.GroupNorm(1, 48),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Conv1d(in_channels=48, out_channels=64, kernel_size=3, stride=1),
-            nn.GroupNorm(1, 64),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Conv1d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
-            nn.GroupNorm(1, 64),
             nn.ReLU(),
             nn.Dropout(0.1),
+            nn.AdaptiveAvgPool1d(4),
             nn.Flatten()
         )
         

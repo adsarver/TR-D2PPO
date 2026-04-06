@@ -56,6 +56,7 @@ class DiffusionMamba2(nn.Module):
         d_head=16,
         expand=2,
         memory_length=48,
+        memory_stride=1,
         odom_expand=64,
         # Action normalisation range  (raw env units → [-1, 1])
         action_low=(-0.34, 0.0),      # (min_steering, min_speed)
@@ -68,6 +69,8 @@ class DiffusionMamba2(nn.Module):
         self.obs_feature_dim = obs_feature_dim
         self.d_model = d_model
         self.memory_length = memory_length
+        self.memory_stride = memory_stride
+        self.step_counter = 0
 
         # --- Action normalisation  (raw ↔ [-1, 1]) ---
         act_lo = torch.tensor(action_low,  dtype=torch.float32)
@@ -87,10 +90,10 @@ class DiffusionMamba2(nn.Module):
         # --- Feature projection (CNN+odom → d_model) ---
         feature_input_size = conv_output_size + odom_expand
         self.feature_projection = nn.Sequential(
-            nn.Linear(feature_input_size, 768),
+            nn.Linear(feature_input_size, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(768, d_model),
+            nn.Linear(256, d_model),
             nn.ReLU(),
         )
 
@@ -149,6 +152,7 @@ class DiffusionMamba2(nn.Module):
 
     @torch.jit.export
     def create_observation_buffer(self, batch_size: int, device: torch.device):
+        self.step_counter = 0
         return torch.zeros(batch_size, self.memory_length, self.d_model, device=device)
 
     # ------------------------------------------------------------------
@@ -181,6 +185,9 @@ class DiffusionMamba2(nn.Module):
         scan_tensor = torch.nan_to_num(scan_tensor, posinf=20.0, neginf=0.0)
         state_tensor = torch.nan_to_num(state_tensor, 0.0)
 
+        # Normalize LiDAR scans to [0, 1] (match critic preprocessing)
+        scan_tensor = scan_tensor.clamp(0.0, 10.0) / 10.0
+
         # CNN → odom expand → concat → project
         vision_features = self.vision_encoder(scan_tensor)
         vision_features = torch.nan_to_num(vision_features, nan=0.0)
@@ -190,11 +197,18 @@ class DiffusionMamba2(nn.Module):
         projected = self.feature_projection(combined)
         projected = torch.nan_to_num(projected, nan=0.0)
 
-        # Shift buffer left, append newest frame
-        obs_buffer = torch.cat([
-            obs_buffer[:, 1:, :],
-            projected.unsqueeze(1),
-        ], dim=1)
+        # Rolling buffer update (stride-aware)
+        # The last slot always holds the freshest feature.
+        # A new historical entry is shifted in every memory_stride steps.
+        self.step_counter += 1
+        if self.memory_stride <= 1 or self.step_counter % self.memory_stride == 0:
+            obs_buffer = torch.cat([
+                obs_buffer[:, 1:, :],
+                projected.unsqueeze(1),
+            ], dim=1)
+        else:
+            obs_buffer = obs_buffer.clone()
+            obs_buffer[:, -1, :] = projected
 
         # Mamba2 temporal pass
         obs_normed = self.pre_mamba_norm(obs_buffer)

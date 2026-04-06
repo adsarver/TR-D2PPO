@@ -41,7 +41,7 @@ EASY_MAPS = ["Hockenheim", "Monza", "Melbourne", "BrandsHatch"]
 MEDIUM_MAPS = ["Oschersleben", "Sakhir", "Sepang", "SaoPaulo", "Budapest", "Catalunya", "Silverstone"]
 HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Nuerburgring", "Sochi",]
 TOTAL_TIMESTEPS = 12_000_000
-STEPS_PER_GENERATION = 2048
+STEPS_PER_GENERATION = 2048  # Initial default; overwritten per-map to 10x track length
 LIDAR_BEAMS = 1080  # Default is 1080
 LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
 INITIAL_POSES = None # Generated later
@@ -81,17 +81,19 @@ obs, timestep, _, _ = env.reset(poses=INITIAL_POSES)
 env.render(mode="human") # Render first to create the window/renderer
 
 # --- Agent Setup ---
-num_generations = TOTAL_TIMESTEPS // STEPS_PER_GENERATION
 
 ORIGINAL_WEIGHT = "models/actor/pretrained/actor_pretrained.pt"
-CRITIC_WEIGHT = "models/critic/pretrained/critic_pretrained.pt"
+CRITIC_WEIGHT = "critic_gen_36.pt"
 
 agent = PPOAgent(
     num_agents=NUM_AGENTS_AI, 
     map_name=CURRENT_MAP,
     steps=STEPS_PER_GENERATION,
     params=params_dict,
-    transfer=[ORIGINAL_WEIGHT, CRITIC_WEIGHT]
+    transfer=[ORIGINAL_WEIGHT, CRITIC_WEIGHT],
+    baseline_speed=10.0,
+    tbtt_length=64,                    # TBTT chunk length (detach temporal state every N steps)
+    checkpoint_every=32,               # Activation checkpointing every N steps within each chunk
 )
 pp_driver = MPCAgent(
     map_name=CURRENT_MAP,
@@ -154,26 +156,58 @@ def _switch_to_new_track(gen_label="init"):
     wp_xy, wp_s, rl = agent._load_waypoints(CURRENT_MAP)
     agent.waypoints_xy, agent.waypoints_s, agent.raceline_length = wp_xy, wp_s, rl
     pp_driver.update_map(CURRENT_MAP)
+
+    agent.clear_experience_buffer()
+
+    # Scale steps & buffer to 10× track length (meters → sim steps)
+    _update_steps_and_buffer(rl)
+
     return INITIAL_POSES
+
+
+def _update_steps_and_buffer(raceline_length):
+    """Set STEPS_PER_GENERATION = 10 * track_length and resize
+    actor/critic Mamba2 buffers + TBTT length to match.
+    memory_length = 10 * track_length / stride  so the buffer
+    covers the full time window via strided insertion."""
+    global STEPS_PER_GENERATION
+    new_steps = int(10 * raceline_length)
+    new_steps = max(new_steps, 512)  # safety floor
+    STEPS_PER_GENERATION = new_steps
+
+    # Access _orig_mod to handle torch.compile wrapper
+    actor_mod = getattr(agent.actor_network, '_orig_mod', agent.actor_network)
+    critic_mod = getattr(agent.critic_network, '_orig_mod', agent.critic_network)
+    # memory_length = total_window / stride
+    stride = agent.stride
+    mem_len = max(new_steps // stride, 16)  # safety floor
+    actor_mod.memory_length = mem_len
+    critic_mod.memory_length = mem_len
+    agent.reset_buffers()
+    print(f"  Steps/gen={new_steps}, buffer={mem_len} (stride={stride}, "
+          f"track={raceline_length:.1f}m)")
+
 
 _switch_to_new_track("init")
 agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
 obs, _, _, _ = env.reset(poses=INITIAL_POSES)
 
-# STEPS_PER_GENERATION = int(agent.raceline_length * 32)  # Adjust steps based on raceline length and desired time per generation
-# agent.update_buffer_size(STEPS_PER_GENERATION)
-# print(f"Adjusted steps per generation to {STEPS_PER_GENERATION} based on raceline length.")
 print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 
 best_avg_reward = -float('inf')
 patience = 0
 
 collision_timers = np.zeros(NUM_AGENTS, dtype=np.int32)
-COLLISION_RESET_THRESHOLD = 1
+COLLISION_RESET_THRESHOLD = 32
 
-for gen in range(num_generations):
+total_steps_done = 0
+gen = 0
+while total_steps_done < TOTAL_TIMESTEPS:
     collisions = 0
-    print(f"\n--- Generation {gen+1} / {num_generations} {CURRENT_MAP} ---")
+    gen += 1
+    print(f"\n--- Generation {gen} {CURRENT_MAP}  "
+          f"(steps={STEPS_PER_GENERATION}, "
+          f"total={total_steps_done}/{TOTAL_TIMESTEPS}) ---")
     total_reward_this_gen = []
     ego_reward_this_gen = []
     current_gen_time = 0.0
@@ -266,23 +300,27 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
         
         obs = next_obs
     
+    total_steps_done += STEPS_PER_GENERATION
     print() # Finish the carriage return line
     current_physics_time = 0.0
     
     # --- END OF GENERATION ---
+    # Flush the last pending transition with a bootstrap value estimate
+    agent.finalize_rollout(obs)
+    
     reward_avg = sum(total_reward_this_gen) / len(total_reward_this_gen)
     current_avg_ego_reward = sum(ego_reward_this_gen) / len(total_reward_this_gen)
 
     if reward_avg > best_avg_reward:
-        torch.save(agent.actor_network.state_dict(), f"models/actor/best/actor_gen_{gen+1}.pt")
-        torch.save(agent.critic_network.state_dict(), f"models/critic/best/critic_gen_{gen+1}.pt")
+        torch.save(agent.actor_network.state_dict(), f"models/actor/best/actor_gen_{gen}.pt")
+        torch.save(agent.critic_network.state_dict(), f"models/critic/best/critic_gen_{gen}.pt")
         best_avg_reward = reward_avg
         print(f"New best model saved with average reward: {reward_avg:.3f}")
         patience = 0
-    elif (gen + 1) % 100 == 0:
-        torch.save(agent.actor_network.state_dict(), f"models/actor/checkpoint/actor_gen_{gen+1}.pt")
-        torch.save(agent.critic_network.state_dict(), f"models/critic/checkpoint/critic_gen_{gen+1}.pt")
-        print(f"Checkpoint saved at generation {gen+1}.")
+    elif gen % 100 == 0:
+        torch.save(agent.actor_network.state_dict(), f"models/actor/checkpoint/actor_gen_{gen}.pt")
+        torch.save(agent.critic_network.state_dict(), f"models/critic/checkpoint/critic_gen_{gen}.pt")
+        print(f"Checkpoint saved at generation {gen}.")
         patience += 1
     else:
         patience += 1
@@ -296,9 +334,10 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
     #     break
     
     # --- Switch to a new random track every GEN_PER_MAP generations ---
-    if (gen + 1) % GEN_PER_MAP == 0:
-        _switch_to_new_track(gen + 1)
-        print(f"Gen {gen+1}: New track \u2192 {CURRENT_MAP}")
+    if gen % GEN_PER_MAP == 0:
+        _switch_to_new_track(gen)
+        print(f"Gen {gen}: New track \u2192 {CURRENT_MAP}  "
+              f"(steps/gen={STEPS_PER_GENERATION})")
         agent.last_cumulative_distance = np.zeros(NUM_AGENTS_AI)
         agent.last_wp_index = np.zeros(NUM_AGENTS_AI, dtype=np.int32)
         env.reset(poses=INITIAL_POSES)

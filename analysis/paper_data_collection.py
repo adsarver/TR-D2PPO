@@ -12,6 +12,17 @@ from utils.utils import *
 import time
 import pickle
 
+BEST_GFPP_PARAMS = {
+    "lookahead_distance": 1.4,
+    "threshold_at_v_min": 1.0,
+    "threshold_at_v_max": 2.5,
+}
+BEST_MPC_PARAMS = {
+    "horizon": 8,
+    "speed_scale": 0.8,
+    "emergency_dist": 0.8,
+}
+
 # --- Race Parameters ---
 NUM_AGENTS_TEST = 1
 NUM_OVERTAKE_AGENTS = 5
@@ -27,8 +38,8 @@ EASY_MAPS = ["Monza", "BrandsHatch"]
 MEDIUM_MAPS = ["Sakhir", "SaoPaulo", "Budapest"]
 HARD_MAPS = ["MoscowRaceway", "Spielberg", "Oschersleben", "Catalunya", "Budapest"]
 
-MAPS = [m for m in MAPS if m not in EASY_MAPS + MEDIUM_MAPS + HARD_MAPS]
-MAPS = ["Catalunya"]
+# MAPS = [m for m in MAPS if m not in EASY_MAPS + MEDIUM_MAPS + HARD_MAPS]
+# MAPS = ["Catalunya"]
 MAP_NAME = "Catalunya"
 RACE_DATA = dict()
 NUM_RACES = 10
@@ -86,7 +97,7 @@ slow_pp = PurePursuit(
 def race(agent, map, lap_count=10, speed_cap=None, old_lstm=False):
     in_collision = True
     env.update_map(get_map_dir(map) + f"/{map}_map", ".png")
-    if type(agent) != SupervisedAgent:
+    if type(agent) != D2PPOAgent:
         agent.update_map(map)
     offset = 0.1
     
@@ -97,7 +108,7 @@ def race(agent, map, lap_count=10, speed_cap=None, old_lstm=False):
         in_collision = obs['collisions'][0] != 0
         env.render(mode='human')
             
-    if type(agent) == SupervisedAgent:
+    if type(agent) == D2PPOAgent:
         agent.reset_buffers()
         
     print(f"\n--- {type(agent).__name__} Starting Lap 0 / {lap_count} on {map} ---")
@@ -126,22 +137,19 @@ def race(agent, map, lap_count=10, speed_cap=None, old_lstm=False):
         # env.render(mode='human_fast')
         
         # Get Action from Agent
-        if type(agent) != SupervisedAgent:
+        if type(agent) != D2PPOAgent:
             action_np = [agent.get_actions_batch(obs)[0]]
         else:
             scan_tensors, state_tensor = agent._obs_to_tensors(obs)
             
-            _, example_tensor, lstm = agent.get_action_and_value(
-                scan_tensors, state_tensor
+            action_tensor, _, _ = agent.get_action_and_value(
+                scan_tensors, state_tensor, deterministic=True
             )
                                 
             # Convert to NumPy for the Gym environment
             
-            if not old_lstm: action_np = example_tensor.cpu().numpy()
-            else: action_np = lstm.cpu().numpy()
-            
-            if action_np[0, 1] > 12.0: action_np[0, 1] *= 0.9
-            
+            action_np = action_tensor.cpu().numpy()
+                        
             # if current_lap > 0:
             #     action_np[..., 1] *= 1.0
             # else:
@@ -178,7 +186,7 @@ supervised = D2PPOAgent(
     map_name=MAP_NAME,
     steps=None,
     params=params_dict,
-    transfer=[None, 'actor_val_best.pt', None]
+    transfer=['models/actor/pretrained/actor_pretrained.pt', None]
 )
 device = supervised.device
 
@@ -187,7 +195,7 @@ pp_driver = PurePursuit(
     lookahead_distance=1.5,        # 1.5 m base — tighter tracking near walls
     wheelbase=params_dict['lf'] + params_dict['lr'],
     max_steering=params_dict['s_max'],
-    max_speed=12.0,
+    max_speed=10.0,
     min_speed=1.0
 )
 
@@ -207,27 +215,26 @@ gap_follow = GapFollow(
 
 gfpp = GapFollowPurePursuit(
     map_name=MAP_NAME,
-    lookahead_distance=1.5,
     wheelbase=params_dict['lf'] + params_dict['lr'],
     max_steering=params_dict['s_max'],
-    max_speed=11.0,
-    min_speed=1.0,
+    num_beams=LIDAR_BEAMS,
+    fov=LIDAR_FOV,
+    **BEST_GFPP_PARAMS
 )
 
 mpc = MPCAgent(
     map_name=MAP_NAME,
     wheelbase=params_dict['lf'] + params_dict['lr'],
     max_steering=params_dict['s_max'],
-    max_speed=11.0,
-    min_speed=1.0,
-    max_accel=params_dict['a_max']
+    max_accel=params_dict['a_max'],
+    **BEST_MPC_PARAMS
 )
 
 speed_limits = [4.0, 8.0, 10.0, 12.0]
 
 # for speed_cap in speed_limits:
 for agent in [supervised]:
-    # if type(agent) != SupervisedAgent: agent.max_speed = speed_cap
+    # if type(agent) != D2PPOAgent: agent.max_speed = speed_cap
     RACE_DATA[type(agent).__name__] = dict()
     for map in MAPS:
         RACE_DATA[type(agent).__name__][map] = dict()

@@ -240,6 +240,11 @@ class TrackGenerator:
                 os.path.join(map_dir, f"{name}_centerline.csv"),
                 cl_xy, cl_wr, cl_wl)
 
+            # 14. Debug visualisation (centerline + raceline colored by speed)
+            self._write_debug_image(
+                os.path.join(map_dir, f"{name}_debug.png"),
+                img, origin, eff_res, cl_xy, rl_xy, rl_kappa)
+
             return name
 
         except Exception:
@@ -532,6 +537,85 @@ class TrackGenerator:
             for i in range(len(xy)):
                 f.write(
                     f"{xy[i, 0]}, {xy[i, 1]}, {w_right[i]}, {w_left[i]}\n")
+
+    def _write_debug_image(self, path, occ_img, origin, resolution,
+                           cl_xy, rl_xy, rl_kappa):
+        """Write a debug PNG showing centerline and raceline on the occupancy map.
+
+        The raceline is colored by a curvature-derived speed estimate
+        (fast on straights, slow in turns) using the plasma colormap,
+        matching the style of ``analysis/post_process.py``.
+        The centerline is drawn as a thin dashed grey line underneath.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.collections as mcoll
+
+        img_arr = np.array(occ_img)
+        img_h, img_w = img_arr.shape[:2]
+
+        # World-coordinate extent of the occupancy image
+        x_min = origin[0]
+        y_min = origin[1]
+        x_max = origin[0] + img_w * resolution
+        y_max = origin[1] + img_h * resolution
+
+        # Curvature-based speed estimate:  v = v_max / (1 + gain * |kappa|)
+        v_max = 15.0
+        v_min = 2.0
+        gain = 8.0
+        speed = v_max / (1.0 + gain * np.abs(rl_kappa))
+        speed = np.clip(speed, v_min, v_max)
+        # Smooth the speed profile so the coloring looks natural
+        speed = gaussian_filter1d(speed, sigma=max(3, len(speed) // 80),
+                                  mode='wrap')
+        speed = np.clip(speed, v_min, v_max)
+
+        V_MIN, V_MAX = 0.0, 15.0
+        cmap = plt.cm.plasma
+        norm = plt.Normalize(V_MIN, V_MAX)
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+        fig.patch.set_facecolor('white')
+        ax.set_facecolor('white')
+
+        # Show occupancy map in world coords
+        ax.imshow(img_arr, extent=[x_min, x_max, y_min, y_max],
+                  aspect='equal', cmap='gray', origin='upper')
+
+        # Centerline — thin dashed grey
+        cl_closed = np.vstack([cl_xy, cl_xy[:1]])
+        ax.plot(cl_closed[:, 0], cl_closed[:, 1],
+                color='#888888', linewidth=0.8, linestyle='--',
+                alpha=0.7, label='Centerline', zorder=2)
+
+        # Raceline — colored by speed
+        rl_closed = np.vstack([rl_xy, rl_xy[:1]])
+        speed_closed = np.concatenate([speed, speed[:1]])
+        points = rl_closed.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        seg_speed = (speed_closed[:-1] + speed_closed[1:]) / 2.0
+
+        lc = mcoll.LineCollection(segments, cmap=cmap, norm=norm,
+                                  linewidths=2.0, zorder=3)
+        lc.set_array(seg_speed)
+        ax.add_collection(lc)
+
+        # Color bar
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+        cbar.set_label("Speed (m/s)", fontsize=14)
+        cbar.ax.tick_params(labelsize=10)
+
+        ax.legend(loc='upper right', fontsize=10)
+        ax.set_title(os.path.basename(os.path.dirname(path)), fontsize=16,
+                     fontweight='bold')
+        ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches='tight', dpi=200, facecolor='white')
+        plt.close(fig)
 
 
 # ──────────────────────────────────────────────────────────────────────
