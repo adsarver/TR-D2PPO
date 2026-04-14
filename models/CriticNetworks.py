@@ -233,6 +233,7 @@ class Mamba2CriticNetwork(nn.Module):
         self.memory_stride = memory_stride
         self.step_counter = 0
         self.d_model = d_model
+        self._obs_buffer = None  # managed internally during inference
         
         # Odom handling — baked-in normalisation ranges
         default_ranges = [
@@ -258,7 +259,7 @@ class Mamba2CriticNetwork(nn.Module):
             nn.ReLU(),
         )
 
-        # Mamba2 temporal backbone
+        # Mamba2Simple temporal backbone
         self.pre_mamba_norm = nn.LayerNorm(d_model)
         self.mamba = Mamba2Simple(
             d_model=d_model,
@@ -283,15 +284,37 @@ class Mamba2CriticNetwork(nn.Module):
         self.step_counter = 0
         return torch.zeros(batch_size, self.memory_length, self.d_model, device=device)
 
-    def encode_observation(self, scan_tensor, state_tensor, obs_buffer):
+    def reset_temporal_state(self, agent_idxs=None):
+        """Reset the internal rolling feature buffer.
+
+        Args:
+            agent_idxs: optional array of agent indices to reset.
+                        If None, resets all agents and the step counter.
+        """
+        if self._obs_buffer is None:
+            return
+        if agent_idxs is None:
+            self._obs_buffer.zero_()
+            self.step_counter = 0
+        else:
+            self._obs_buffer[agent_idxs] = 0.0
+
+    def encode_observation(self, scan_tensor, state_tensor, obs_buffer=None):
         """
         Encode raw observations through CNN + Mamba2 temporal backbone.
+
+        When *obs_buffer* is not supplied the network manages an internal
+        buffer and returns only ``critic_features``.  When an explicit buffer
+        is passed (TBTT training) the updated buffer is returned as well.
         """
         batch_size = scan_tensor.shape[0]
         device = scan_tensor.device
+        _using_internal = obs_buffer is None
 
-        if obs_buffer is None:
-            obs_buffer = self.create_observation_buffer(batch_size, device)
+        if _using_internal:
+            if self._obs_buffer is None or self._obs_buffer.shape[0] != batch_size:
+                self._obs_buffer = self.create_observation_buffer(batch_size, device)
+            obs_buffer = self._obs_buffer
         if obs_buffer.device != device:
             obs_buffer = obs_buffer.to(device)
 
@@ -325,6 +348,9 @@ class Mamba2CriticNetwork(nn.Module):
         mamba_out = self.mamba(obs_normed)
         critic_features = self.norm_layer(mamba_out[:, -1, :])
 
+        if _using_internal:
+            self._obs_buffer = obs_buffer
+            return critic_features
         return critic_features, obs_buffer
 
     def forward_from_features(self, critic_features):

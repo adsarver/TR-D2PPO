@@ -9,7 +9,6 @@ process (DDPM).  This agent uses **only** the PPO (Stage 2) objective — no
 supervised / BC pre-training or dispersive loss.
 """
 
-from collections import deque
 import math
 import os
 import numpy as np
@@ -62,12 +61,13 @@ class D2PPOAgent:
         params,
         transfer=(None, None),
         # Diffusion config
-        num_diffusion_steps=10,
+        num_diffusion_steps=100,
         beta_schedule="cosine",
-        baseline_speed=7.5,
+        baseline_speed=6.0,
         # TBTT config (0 = disabled, uses shuffled minibatches)
         tbtt_length=0,
         checkpoint_every=0,
+        ddim_k=5, # 1 for training, 0 for eval, 5 for fine-tune
     ):
         # --- Hyperparameters ---
         self.num_agents = num_agents
@@ -143,14 +143,14 @@ class D2PPOAgent:
             encoder=actor_encoder,
             num_diffusion_steps=num_diffusion_steps,
             inference_steps=5,          # DDIM fast sampling for rollout/deploy
-            obs_feature_dim=64,
+            obs_feature_dim=16,
             time_emb_dim=32,
             hidden_dims=(128, 128),
             beta_schedule=beta_schedule,
-            d_model=64,
+            d_model=16,
             d_state=16,
             d_conv=4,
-            d_head=16,
+            d_head=8,
             expand=2,
             memory_length=128,
             memory_stride=self.stride,
@@ -165,7 +165,7 @@ class D2PPOAgent:
             state_dim=self.state_dim,
             encoder=critic_encoder,
             d_model=16,
-            d_state=8,
+            d_state=16,
             d_conv=4,
             d_head=8,
             expand=2,
@@ -205,18 +205,6 @@ class D2PPOAgent:
         self.diagnostics_history = {key: [] for key in self.diagnostic_keys}
         self.generation_counter = 0
 
-        # --- Mamba2 temporal state (buffer-only, no hidden states like LSTM) ---
-        self.actor_buffer = deque(
-            [self.actor_network.create_observation_buffer(self.num_agents, self.device)],
-            maxlen=2,
-        )
-
-        # --- Critic Mamba2 temporal state ---
-        self.critic_buffer = deque(
-            [self.critic_network.create_observation_buffer(self.num_agents, self.device)],
-            maxlen=2,
-        )
-
         # For computing acceleration from consecutive velocity observations
         # (the sim's linear_accel_x is always 0)
         self._prev_vels_x = np.zeros(self.num_agents)
@@ -224,8 +212,8 @@ class D2PPOAgent:
 
         # --- Deployment mode ---
         self._deploy_mode = False
-        self._deploy_action_repeat = 1      # run inference every N sim steps
-        self._deploy_ddim_steps = 2         # DDIM steps in deploy mode
+        self._deploy_action_repeat = 0      # run inference every N sim steps
+        self._deploy_ddim_steps = 1         # DDIM steps in deploy mode (paper: 0 intermediate = 1 call)
         self._cached_action = None          # last action for repeating
         self._action_repeat_counter = 0     # counts sim steps since last inference
         
@@ -236,12 +224,13 @@ class D2PPOAgent:
     # ------------------------------------------------------------------
     # Deployment mode  (optimised for Jetson Orin Nano ~100 Hz)
     # ------------------------------------------------------------------
-    def deploy(self, action_repeat=5, ddim_steps=2, compile_model=True):
+    def deploy(self, action_repeat=0, ddim_steps=1, compile_model=True):
         """Switch to optimised deployment inference.
 
         Optimisations applied:
-        1. DDIM-``ddim_steps`` instead of full 10-step DDPM (5-10x fewer
-           denoiser calls).
+        1. DDIM-``ddim_steps`` instead of full 100-step DDPM.  The D2PPO
+           paper uses 0 intermediate DDIM steps (``ddim_steps=1``, i.e.
+           a single denoiser call that jumps directly to x_0).
         2. Action repeat — only run inference every ``action_repeat`` sim
            steps; intermediate steps reuse the cached action.
         3. Full fp16 inference (safe with ≤2 DDIM steps).
@@ -259,7 +248,6 @@ class D2PPOAgent:
         # Drop critic — not needed during deployment
         if hasattr(self, 'critic_network'):
             del self.critic_network
-            del self.critic_buffer
             del self.critic_optimizer
             del self.critic_scaler
             torch.cuda.empty_cache()
@@ -277,6 +265,23 @@ class D2PPOAgent:
 
         print(f"[deploy] DDIM-{self._deploy_ddim_steps}, "
               f"action_repeat={self._deploy_action_repeat}, fp16=True")
+
+    # ------------------------------------------------------------------
+    # Temporal state reset  (zeros the Mamba2 rolling feature buffers)
+    # ------------------------------------------------------------------
+    def reset_temporal_state(self, agent_idxs=None):
+        """Reset internal temporal buffers on actor and critic networks.
+
+        Args:
+            agent_idxs: optional array of agent indices to reset.
+                        If None, resets all agents.
+        """
+        self.actor_network.reset_temporal_state(agent_idxs)
+        if hasattr(self, 'critic_network'):
+            self.critic_network.reset_temporal_state(agent_idxs)
+
+    # Backwards-compatible alias used by train.py, val.py, etc.
+    reset_buffers = reset_temporal_state
 
     # ------------------------------------------------------------------
     # Critic pretraining  (run once before RL loop)
@@ -353,7 +358,7 @@ class D2PPOAgent:
                 poses = generate_start_poses(map_name, num_agents_total)
                 obs, _, _, _ = env.reset(poses=poses)
                 self.reset_progress_trackers(initial_poses_xy=poses[:, :2])
-                self.reset_buffers()
+                self.reset_temporal_state()
                 self._prev_vels_x[:] = 0
 
                 collision_timers = np.zeros(num_agents_total, dtype=np.int32)
@@ -385,7 +390,7 @@ class D2PPOAgent:
                                             next_obs['poses_theta']], axis=1)
                         new_poses = generate_start_poses(map_name, num_agents_total, agent_poses=cur_poses)
                         next_obs, _, _, _ = env.reset(poses=new_poses, agent_idxs=stuck)
-                        self.reset_buffers(stuck)
+                        self.reset_temporal_state(stuck)
                         self.reset_progress_trackers(initial_poses_xy=new_poses[:, :2], agent_idxs=stuck)
                         collision_timers[stuck] = 0
 
@@ -459,8 +464,9 @@ class D2PPOAgent:
                 st = X_states[idx].to(self.device)
                 y = Y_returns[idx].to(self.device)
 
-                # Forward: encode single frame (no obs_buffer)
-                feat, _ = self.critic_network.encode_observation(s, st, obs_buffer=None)
+                # Forward: encode single frame (fresh zero buffer = no temporal context)
+                _buf = self.critic_network.create_observation_buffer(s.shape[0], self.device)
+                feat, _ = self.critic_network.encode_observation(s, st, obs_buffer=_buf)
                 pred = self.critic_network.fc_layers(feat).squeeze(-1)
                 loss = F.smooth_l1_loss(pred, y)
 
@@ -499,35 +505,11 @@ class D2PPOAgent:
         print(f"  Saved critic weights \u2192 {critic_save_path}")
 
         # Reset temporal state for clean start
-        self.reset_buffers()
+        self.reset_temporal_state()
         self._prev_vels_x[:] = 0
 
         print(f"  Critic pretraining complete.  Best loss: {best_loss:.4f}")
         print("=" * 60 + "\n")
-
-    def reset_buffers(self, agent_indices=None):
-        """Reset observation buffers for both actor and critic (Mamba2 — no hidden states)."""
-        if agent_indices is None:
-            # Full reset for all agents
-            self.actor_buffer = deque(
-                [self.actor_network.create_observation_buffer(self.num_agents, self.device)],
-                maxlen=2,
-            )
-            self.critic_buffer = deque(
-                [self.critic_network.create_observation_buffer(self.num_agents, self.device)],
-                maxlen=2,
-            )
-            self._prev_vels_x = np.zeros(self.num_agents)
-        else:
-            agent_indices = agent_indices[agent_indices < self.num_agents]
-            # Per-agent reset: zero out specific agent slots
-            if self.actor_buffer[-1] is not None:
-                for idx in agent_indices:
-                    self.actor_buffer[-1][idx] = 0.0
-            if self.critic_buffer[-1] is not None:
-                for idx in agent_indices:
-                    self.critic_buffer[-1][idx] = 0.0
-            self._prev_vels_x[agent_indices] = 0.0
     
     def get_action_and_value(self, scan_tensor, state_tensor, deterministic=False, store=True):
         """
@@ -551,22 +533,12 @@ class D2PPOAgent:
         with torch.no_grad():
             # Value estimate (critic with Mamba2 temporal state)
             if not deterministic:
-                critic_features, new_critic_buf = self.critic_network.encode_observation(
+                critic_features = self.critic_network.encode_observation(
                     scan_tensor[: self.num_agents],
                     state_tensor[: self.num_agents],
-                    self.critic_buffer[-1],
                 )
+                self._last_critic_features = critic_features.float()
                 value = self.critic_network.fc_layers(critic_features)
-
-                if store:
-                    # Advance critic temporal state only during data collection,
-                    # NOT during bootstrapping (store=False).  The bootstrap call
-                    # in store_transition would otherwise advance the buffer a
-                    # second time per step, doubling the temporal sequence and
-                    # corrupting the Mamba2 representation.
-                    self.critic_buffer.append(new_critic_buf)
-                    # Cache critic features for store_transition
-                    self._last_critic_features = critic_features.float()
 
                 if not store:
                     # Bootstrapping: only value needed — skip diffusion entirely
@@ -575,10 +547,9 @@ class D2PPOAgent:
 
             # Encode observation through CNN + Mamba2
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                obs_features, new_buffer = self.actor_network.encode_observation(
+                obs_features = self.actor_network.encode_observation(
                     scan_tensor[: self.num_agents],
                     state_tensor[: self.num_agents],
-                    self.actor_buffer[-1],
                 )
 
             # Run reverse diffusion in float32 — the iterative chain
@@ -615,9 +586,6 @@ class D2PPOAgent:
             if torch.isnan(action).any():
                 print("[WARNING] NaN in sampled action — replacing with zeros")
                 action = torch.nan_to_num(action, nan=0.0)
-                
-            # Advance temporal state (Mamba2: buffer only, no hidden states)
-            self.actor_buffer.append(new_buffer)
 
             # Cache obs_features for store_transition (avoids re-encoding
             # with zero hidden states during learn(), eliminating the
@@ -625,6 +593,50 @@ class D2PPOAgent:
             self._last_obs_features = obs_features.float()
 
         return action, log_prob, value.squeeze(-1) if value is not None and value.ndim > 1 else value
+
+    # ------------------------------------------------------------------
+    # Deploy-mode fast inference  (DDIM-few + action repeat + fp16)
+    # ------------------------------------------------------------------
+    def _get_action_deploy(self, scan_tensor, state_tensor):
+        """Optimised inference for deployment (~100 Hz on Jetson Orin Nano).
+
+        - Only runs the actor (no critic).
+        - Uses DDIM with very few steps (default 2).
+        - Entire pipeline in fp16 (model weights already .half()'d).
+        - Action repeat: returns cached action on non-inference steps,
+          but *always* updates the Mamba2 buffer so temporal context
+          stays correct.
+        """
+        self._action_repeat_counter += 1
+        need_new_action = (
+            self._cached_action is None
+            or self._action_repeat_counter >= self._deploy_action_repeat
+        )
+
+        with torch.no_grad():
+            # Always update temporal buffer (even on repeat steps)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                obs_features = self.actor_network.encode_observation(
+                    scan_tensor[: self.num_agents],
+                    state_tensor[: self.num_agents],
+                )
+
+            if need_new_action:
+                # DDIM with few steps, fully in fp16
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    action = self.actor_network.ddim_sample_action(
+                        obs_features, num_steps=self._deploy_ddim_steps, eta=0.0
+                    )
+                action = action.clamp(
+                    self.actor_network.action_lo.unsqueeze(0),
+                    self.actor_network.action_hi.unsqueeze(0),
+                )
+                if torch.isnan(action).any():
+                    action = torch.nan_to_num(action, nan=0.0)
+                self._cached_action = action
+                self._action_repeat_counter = 0
+
+        return self._cached_action, None, None
 
 
     def store_transition(self, obs, next, action, log_prob, reward, done, value):
@@ -1174,8 +1186,8 @@ class D2PPOAgent:
                 chunk_len = chunk_end - chunk_start
 
                 # Detach temporal state at chunk boundary (truncated BPTT)
-                actor_obs_buffer = actor_obs_buffer.detach()
-                critic_obs_buffer = critic_obs_buffer.detach()
+                actor_obs_buffer = actor_obs_buffer.detach().requires_grad_()
+                critic_obs_buffer = critic_obs_buffer.detach().requires_grad_()
 
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 self.critic_optimizer.zero_grad(set_to_none=True)
@@ -1205,7 +1217,6 @@ class D2PPOAgent:
                                 value_targets_all[seg_start:seg_end],
                                 old_values_all[seg_start:seg_end],
                                 use_reentrant=False,
-                                preserve_rng_state=True,
                             )
                         chunk_actor = chunk_actor + sa
                         chunk_critic = chunk_critic + sc

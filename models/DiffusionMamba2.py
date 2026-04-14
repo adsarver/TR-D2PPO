@@ -27,11 +27,11 @@ from mamba_ssm.modules.mamba2_simple import Mamba2Simple
 
 class DiffusionMamba2(nn.Module):
     """
-    Diffusion Policy actor with Mamba2Simple temporal backbone.
+    Diffusion Policy actor with Mamba2 temporal backbone.
 
     Observation encoder follows the same pattern as ``RLMamba2Racer``:
         VisionEncoder → odom_expand → feature_projection
-        → Mamba2Simple (temporal) → pre_mamba_norm / norm_layer
+        → Mamba2 (temporal) → pre_mamba_norm / norm_layer
     The final observation embedding is fed into a DDPM denoising MLP that
     iteratively refines pure noise into an action.
 
@@ -71,6 +71,7 @@ class DiffusionMamba2(nn.Module):
         self.memory_length = memory_length
         self.memory_stride = memory_stride
         self.step_counter = 0
+        self._obs_buffer = None  # managed internally during inference
 
         # --- Action normalisation  (raw ↔ [-1, 1]) ---
         act_lo = torch.tensor(action_low,  dtype=torch.float32)
@@ -155,29 +156,53 @@ class DiffusionMamba2(nn.Module):
         self.step_counter = 0
         return torch.zeros(batch_size, self.memory_length, self.d_model, device=device)
 
+    def reset_temporal_state(self, agent_idxs=None):
+        """Reset the internal rolling feature buffer.
+
+        Args:
+            agent_idxs: optional array of agent indices to reset.
+                        If None, resets all agents and the step counter.
+        """
+        if self._obs_buffer is None:
+            return
+        if agent_idxs is None:
+            self._obs_buffer.zero_()
+            self.step_counter = 0
+        else:
+            self._obs_buffer[agent_idxs] = 0.0
+
     # ------------------------------------------------------------------
     # Observation encoding  (VisionEncoder → Mamba2)
     # ------------------------------------------------------------------
 
-    def encode_observation(self, scan_tensor, state_tensor, obs_buffer,
+    def encode_observation(self, scan_tensor, state_tensor, obs_buffer=None,
                            max_speed_estimate=20.0):
         """
         Encode raw observations through CNN + Mamba2 temporal backbone.
 
+        When *obs_buffer* is **not** supplied the network manages an internal
+        rolling buffer (``self._obs_buffer``) and returns only ``obs_features``.
+        When an explicit *obs_buffer* is passed (e.g. during TBTT training) the
+        updated buffer is returned as a second value so the caller can
+        detach / checkpoint it.
+
         Args:
             scan_tensor:  (B, 1, num_beams)
             state_tensor: (B, state_dim)
-            obs_buffer:   (B, memory_length, d_model) – rolling feature buffer
+            obs_buffer:   (B, memory_length, d_model) – optional external buffer
 
         Returns:
-            obs_features: (B, obs_feature_dim)
-            obs_buffer:   updated buffer (shifted left, new frame appended)
+            obs_features          when using internal buffer
+            (obs_features, obs_buffer) when an external buffer was supplied
         """
         batch_size = scan_tensor.shape[0]
         device = scan_tensor.device
+        _using_internal = obs_buffer is None
 
-        if obs_buffer is None:
-            obs_buffer = self.create_observation_buffer(batch_size, device)
+        if _using_internal:
+            if self._obs_buffer is None or self._obs_buffer.shape[0] != batch_size:
+                self._obs_buffer = self.create_observation_buffer(batch_size, device)
+            obs_buffer = self._obs_buffer
         if obs_buffer.device != device:
             obs_buffer = obs_buffer.to(device)
 
@@ -218,6 +243,9 @@ class DiffusionMamba2(nn.Module):
         obs_features = self.norm_layer(mamba_out[:, -1, :])
         obs_features = torch.nan_to_num(obs_features, nan=0.0)
 
+        if _using_internal:
+            self._obs_buffer = obs_buffer
+            return obs_features
         return obs_features, obs_buffer
 
     # ------------------------------------------------------------------

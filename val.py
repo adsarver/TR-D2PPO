@@ -81,6 +81,12 @@ def parse_args():
     p.add_argument("--render", action="store_true", help="Render the environment")
     p.add_argument("--speed", type=float, default=BASELINE_SPEED,
                    help="Max speed for baselines on generated tracks")
+    p.add_argument("--action-repeat", type=int, default=5,
+                   help="Action repeat interval (1=every step, 5=every 5th)")
+    p.add_argument("--ddim-steps", type=int, default=1,
+                   help="DDIM denoising steps for deployment (1-5)")
+    p.add_argument("--no-deploy", action="store_true",
+                   help="Disable deploy optimisations (use full DDPM)")
     return p.parse_args()
 
 
@@ -254,6 +260,13 @@ def main():
         params=PARAMS_DICT,
         transfer=[args.actor, args.critic],
     )
+
+    # Enable deployment optimisations (DDIM-few + action repeat + fp16)
+    if not args.no_deploy:
+        d2ppo.deploy(
+            action_repeat=args.action_repeat,
+            ddim_steps=args.ddim_steps,
+        )
 
     # --- Race Loop ---
     print(f"\n{'=' * 70}")

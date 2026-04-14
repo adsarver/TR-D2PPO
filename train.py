@@ -92,7 +92,7 @@ agent = PPOAgent(
     params=params_dict,
     transfer=[ORIGINAL_WEIGHT, CRITIC_WEIGHT],
     baseline_speed=10.0,
-    tbtt_length=64,                    # TBTT chunk length (detach temporal state every N steps)
+    tbtt_length=32 * 50,               # 32 buffer shifts × stride; overridden per-map in _update_steps_and_buffer
     checkpoint_every=32,               # Activation checkpointing every N steps within each chunk
 )
 pp_driver = MPCAgent(
@@ -183,9 +183,17 @@ def _update_steps_and_buffer(raceline_length):
     mem_len = max(new_steps // stride, 16)  # safety floor
     actor_mod.memory_length = mem_len
     critic_mod.memory_length = mem_len
+
+    # Scale TBTT so gradients flow through enough buffer shifts.
+    # With stride=50 & tbtt_length=64 only 1.3 shifts would occur per
+    # window — far too few for temporal gradient flow.  We want ~32
+    # buffer shifts per window, capped at the generation length.
+    TBTT_SHIFTS = 32
+    agent.tbtt_length = min(TBTT_SHIFTS * stride, new_steps)
+
     agent.reset_buffers()
-    print(f"  Steps/gen={new_steps}, buffer={mem_len} (stride={stride}, "
-          f"track={raceline_length:.1f}m)")
+    print(f"  Steps/gen={new_steps}, buffer={mem_len}, tbtt={agent.tbtt_length} "
+          f"(stride={stride}, track={raceline_length:.1f}m)")
 
 
 _switch_to_new_track("init")
