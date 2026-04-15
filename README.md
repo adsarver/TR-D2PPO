@@ -283,3 +283,18 @@ epochs               = 10
   - `mamba-ssm==2.3.0`
   - `torchrl==0.10.0`
   - `numpy`, `scipy`, `matplotlib`, `PyYAML`, `einops`
+
+---
+
+## License
+
+This project is licensed under a modified **[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)**.
+
+**In short:**
+
+- ✅ **Free** for personal use, academic research, education, and non-profit work.
+- ❌ **Commercial use is not permitted** without a separate commercial license.
+
+If you or your organization wish to use this software for commercial purposes (including integration into commercial products or services), please contact **andsarve15@gmail.com** to discuss licensing terms.
+
+See the full [LICENSE](./LICENSE) file for details.
