@@ -23,6 +23,29 @@ def linear_beta_schedule(num_timesteps, beta_start=1e-4, beta_end=0.02):
     return torch.linspace(beta_start, beta_end, num_timesteps)
 
 
+# ===========================================================================
+# Dispersive InfoNCE-L2 loss (shared by weight_initializer + D2PPO_agent)
+# ===========================================================================
+
+def dispersive_loss_infonce_l2(features, temperature=0.5):
+    """InfoNCE-style dispersive loss with squared L2 distance.
+
+    Based on D²PPO (Zou et al., 2025):
+        L_disp = log( mean_{i,j}[ exp( -D(h_i, h_j) / τ ) ] )
+
+    Uses RAW features (no L2 normalisation). Distance is the *per-dimension*
+    mean squared difference so that τ = 0.5 works regardless of feature
+    dimensionality. Includes the diagonal (i == j) for numerical stability.
+    """
+    B = features.shape[0]
+    if B < 2:
+        return torch.tensor(0.0, device=features.device)
+    diff = features.unsqueeze(0) - features.unsqueeze(1)   # (B, B, D)
+    sq_dist = (diff ** 2).mean(dim=-1)                      # (B, B)
+    exp_neg_dist = torch.exp(-sq_dist / temperature)
+    return torch.log(exp_neg_dist.mean())
+
+
 def extract(a, t, x_shape):
     """Extract coefficients at timesteps *t*, reshaped for broadcasting."""
     # Ensure t is a 1-D long tensor of shape (batch,)

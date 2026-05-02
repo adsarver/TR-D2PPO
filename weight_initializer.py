@@ -40,7 +40,7 @@ from models.AuxModels import VisionEncoder
 from models.DiffusionLSTM import DiffusionLSTM
 from models.DiffusionMamba2 import DiffusionMamba2
 from utils.diffusion_utils import cosine_beta_schedule, linear_beta_schedule
-from utils.diffusion_utils import extract
+from utils.diffusion_utils import extract, dispersive_loss_infonce_l2
 from baselines.mpc_agent import MPCAgent
 from utils.utils import get_map_dir, generate_start_poses
 
@@ -48,21 +48,6 @@ from utils.utils import get_map_dir, generate_start_poses
 RACING_RL_PATH = "/home/WVU-AD/ads00024/racing_rl"
 if RACING_RL_PATH not in sys.path:
     sys.path.insert(0, RACING_RL_PATH)
-
-# Dispersive loss functions (same as D2PPO_agent.py)
-def dispersive_loss_infonce_l2(features, temperature=0.5):
-    B = features.shape[0]
-    if B < 2:
-        return torch.tensor(0.0, device=features.device)
-    # Project to unit sphere (standard in contrastive learning)
-    features = F.normalize(features, dim=-1)
-    diff = features.unsqueeze(0) - features.unsqueeze(1)
-    sq_dist = (diff ** 2).sum(dim=-1)
-    mask = ~torch.eye(B, dtype=torch.bool, device=features.device)
-    sq_dist_masked = sq_dist[mask].reshape(B, B - 1)
-    log_exp = -sq_dist_masked / temperature
-    loss = torch.logsumexp(log_exp.reshape(-1), dim=0) - math.log(B * (B - 1))
-    return loss
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -79,7 +64,7 @@ PARAMS_DICT = {
 
 NUM_BEAMS  = 1080
 LIDAR_FOV  = 4.7
-STATE_DIM  = 4
+STATE_DIM  = 3
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -160,13 +145,19 @@ def _collect_single_map(
         collisions = np.array(next_obs["collisions"])
         velocities = np.array(next_obs["linear_vels_x"])
 
+        # Determine which agents will be reset this step
+        stuck = (collisions == 1) | (np.abs(velocities) < 0.1)
+        collision_timers[stuck] += 1
+        collision_timers[~stuck] = 0
+        to_reset = np.where(collision_timers >= collision_reset_threshold)[0]
+        reset_set = set(to_reset.tolist()) if len(to_reset) > 0 else set()
+
         for a_idx in range(num_agents):
             scan_np = np.asarray(obs["scans"][a_idx], dtype=np.float32)
             state_np = np.array([
                 obs["linear_vels_x"][a_idx],
                 obs["linear_vels_y"][a_idx],
                 obs["ang_vels_z"][a_idx],
-                obs["linear_accel_x"][a_idx],
             ], dtype=np.float32)
             action_np = actions[a_idx].astype(np.float32)
 
@@ -180,14 +171,10 @@ def _collect_single_map(
                 "agent":  a_idx,
                 "next_velocity":  float(velocities[:num_agents][a_idx]),
                 "next_collision": int(collisions[:num_agents][a_idx]),
+                "done": int(a_idx in reset_set),
             })
 
-        # Stuck detection → reset
-        stuck = (collisions == 1) | (np.abs(velocities) < 0.1)
-        collision_timers[stuck] += 1
-        collision_timers[~stuck] = 0
-
-        to_reset = np.where(collision_timers >= collision_reset_threshold)[0]
+        # Execute reset
         if len(to_reset) > 0:
             cur_poses = np.stack([
                 next_obs["poses_x"], next_obs["poses_y"], next_obs["poses_theta"]
@@ -202,31 +189,17 @@ def _collect_single_map(
     return demos
 
 
-def _collect_single_map_pretrained(
-    map_name: str,
-    pretrained_model_path: str,
-    num_agents: int,
-    steps_per_map: int,
-    collision_reset_threshold: int,
-    num_noise_agents: int = 16,
-) -> list[dict]:
+def _env_worker_fn(conn, map_name, num_agents, num_noise_agents,
+                   collision_reset_threshold):
     """
-    Worker function executed in its own process.
-    Loads the pretrained ExampleNetwork (LSTM-based) from racing_rl and uses it
-    to collect (scan, state, action) demonstrations.
+    Subprocess: owns one gym env + MPC noise controller.
+    Receives expert actions via *conn*, steps the env, sends back
+    observations and demo metadata.  Runs on its own CPU core.
     """
     import gym as _gym
-    import sys
-    
-    # Add racing_rl to path
-    if RACING_RL_PATH not in sys.path:
-        sys.path.insert(0, RACING_RL_PATH)
-    from model import ExampleNetwork, VisionEncoder as RacingVisionEncoder
-    
-    demos: list[dict] = []
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     total_agents = num_agents + num_noise_agents
+    SIM_DT = 0.01
 
     env = _gym.make(
         "f110_gym:f110-v0",
@@ -237,23 +210,167 @@ def _collect_single_map_pretrained(
         params=PARAMS_DICT,
     )
 
-    # Load pretrained LSTM-based model from racing_rl
-    # Architecture matches actor_val_best.pt: lstm_hidden_size=512, lstm_num_layers=2
+    noise_mpc = MPCAgent(
+        map_name=map_name,
+        wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
+        max_steering=PARAMS_DICT['s_max'],
+        max_accel=PARAMS_DICT['a_max'],
+        LIDAR_FOV=LIDAR_FOV,
+        num_beams=NUM_BEAMS,
+        horizon=8, speed_scale=0.8,
+        emergency_dist=0.8, speed_clamp=7.5,
+    )
+
+    poses = generate_start_poses(map_name, total_agents)
+    obs, _, _, _ = env.reset(poses=poses)
+
+    collision_timers = np.zeros(total_agents, dtype=np.int32)
+    prev_vels_x = np.zeros(total_agents, dtype=np.float32)
+
+    def _build_obs_arrays(obs_dict):
+        """Extract numpy arrays from obs dict for pipe transport."""
+        nonlocal prev_vels_x
+        scans = np.array(obs_dict["scans"], dtype=np.float32)
+        lvx = np.array(obs_dict["linear_vels_x"], dtype=np.float32)
+        s3d = np.stack([lvx, obs_dict["linear_vels_y"],
+                        obs_dict["ang_vels_z"]], axis=1).astype(np.float32)
+        accel = np.clip((lvx - prev_vels_x) / SIM_DT, -10.0, 10.0)
+        s4d = np.column_stack([s3d, accel]).astype(np.float32)
+        prev_vels_x = lvx.copy()
+        return scans, s3d, s4d
+
+    # Send initial observations to main process
+    scans, s3d, s4d = _build_obs_arrays(obs)
+    conn.send(("init", scans, s3d, s4d))
+
+    while True:
+        msg = conn.recv()
+        if msg is None:  # shutdown
+            break
+
+        expert_actions = msg  # (total_agents, 2)
+
+        # Apply MPC noise for background traffic
+        noise_actions = noise_mpc.get_actions_batch(obs)
+        actions = expert_actions.copy()
+        actions[num_agents:] = noise_actions[:num_noise_agents]
+        actions[-3:] = np.array([0.0, 0.0])
+
+        next_obs, _, _, _ = env.step(actions)
+
+        # Collision / stuck detection
+        collisions = np.array(next_obs["collisions"])
+        velocities = np.array(next_obs["linear_vels_x"])
+        stuck = (collisions == 1) | (np.abs(velocities) < 0.1)
+        collision_timers[stuck] += 1
+        collision_timers[~stuck] = 0
+        to_reset = np.where(
+            collision_timers >= collision_reset_threshold)[0]
+
+        # Demo metadata (actions taken, next-step reward info)
+        demo_meta = (
+            actions[:num_agents].astype(np.float32).copy(),
+            velocities[:num_agents].astype(np.float32).copy(),
+            collisions[:num_agents].astype(np.int32).copy(),
+            to_reset[to_reset < num_agents].tolist(),
+        )
+
+        # Reset stuck agents
+        reset_all = to_reset.tolist()
+        if len(to_reset) > 0:
+            cur_poses = np.stack([
+                next_obs["poses_x"], next_obs["poses_y"],
+                next_obs["poses_theta"],
+            ], axis=1)
+            new_poses = generate_start_poses(
+                map_name, total_agents, agent_poses=cur_poses)
+            next_obs, _, _, _ = env.reset(
+                poses=new_poses, agent_idxs=to_reset)
+            collision_timers[to_reset] = 0
+            prev_vels_x[to_reset] = 0.0
+
+        obs = next_obs
+        scans, s3d, s4d = _build_obs_arrays(obs)
+        conn.send(("step", scans, s3d, s4d, demo_meta, reset_all))
+
+    env.close()
+    conn.close()
+
+
+def _collect_pretrained_batched(
+    map_names: list[str],
+    pretrained_model_path: str,
+    num_agents: int,
+    steps_per_map: int,
+    collision_reset_threshold: int,
+    num_noise_agents: int = 16,
+    verbose: bool = True,
+) -> list[dict]:
+    """
+    Run *len(map_names)* gym environments in **separate subprocesses**
+    (one per CPU core), batching all agents into a single GPU forward
+    pass of the pretrained expert model each step.
+
+    Architecture:
+        Main process (GPU) ←→ Worker 0 (CPU core, env 0)
+                            ←→ Worker 1 (CPU core, env 1)
+                            ←→ Worker 2 (CPU core, env 2)
+
+    Each step:
+        1. Main gathers obs from workers (already received)
+        2. Batched GPU forward pass → expert actions
+        3. Send actions to all workers (they step in parallel)
+        4. Receive results from all workers
+    """
+    import sys
+
+    if RACING_RL_PATH not in sys.path:
+        sys.path.insert(0, RACING_RL_PATH)
+    from model import ExampleNetwork, VisionEncoder as RacingVisionEncoder
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    E = len(map_names)
+    total_agents = num_agents + num_noise_agents
+    N_total = E * total_agents
+
+    # ── Spawn env worker processes (fork to avoid re-importing module) ─
+    ctx = mp.get_context("fork")
+    parent_conns = []
+    workers = []
+    for map_name in map_names:
+        parent_conn, child_conn = ctx.Pipe()
+        p = ctx.Process(
+            target=_env_worker_fn,
+            args=(child_conn, map_name, num_agents, num_noise_agents,
+                  collision_reset_threshold),
+            daemon=True,
+        )
+        p.start()
+        child_conn.close()  # parent doesn't use child end
+        parent_conns.append(parent_conn)
+        workers.append(p)
+
+    # Receive initial observations from all workers
+    all_scans = []   # list of (total_agents, beams) per env
+    all_s3d = []     # list of (total_agents, 3) per env
+    all_s4d = []     # list of (total_agents, 4) per env
+    for conn in parent_conns:
+        tag, scans, s3d, s4d = conn.recv()
+        all_scans.append(scans)
+        all_s3d.append(s3d)
+        all_s4d.append(s4d)
+
+    # ── Load expert model (single instance on GPU) ───────────────────
     encoder = RacingVisionEncoder(num_scan_beams=NUM_BEAMS)
     expert_model = ExampleNetwork(
-        state_dim=STATE_DIM,
-        action_dim=2,
-        encoder=encoder,
-        lstm_hidden_size=512,
-        lstm_num_layers=2,
-        memory_length=48,
-        memory_stride=1,
+        state_dim=4, action_dim=2, encoder=encoder,
+        lstm_hidden_size=512, lstm_num_layers=2,
+        memory_length=48, memory_stride=1,
     ).to(device)
-    
-    # Load weights
-    checkpoint = torch.load(pretrained_model_path, map_location=device, weights_only=False)
+
+    checkpoint = torch.load(pretrained_model_path, map_location=device,
+                            weights_only=False)
     if isinstance(checkpoint, dict):
-        # Strip common wrapper prefixes
         state_dict = {}
         for k, v in checkpoint.items():
             if not isinstance(v, torch.Tensor):
@@ -267,113 +384,88 @@ def _collect_single_map_pretrained(
         if result.missing_keys:
             print(f"  [Warning] Missing keys: {result.missing_keys[:5]}...")
         if result.unexpected_keys:
-            print(f"  [Warning] Unexpected keys: {result.unexpected_keys[:5]}...")
-    
+            print(f"  [Warning] Unexpected keys: "
+                  f"{result.unexpected_keys[:5]}...")
     expert_model.eval()
-    print(f"  [Pretrained] Loaded LSTM model from {pretrained_model_path}")
-    
-    # Initialize LSTM hidden states and observation buffer
-    obs_buffer = expert_model.create_observation_buffer(total_agents, device)
-    hidden_h, hidden_c = expert_model.get_init_hidden(total_agents, device, transpose=True)
-    
-    # MPC for noise agents (background traffic)
-    noise_mpc = MPCAgent(
-        map_name=map_name,
-        wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
-        max_steering=PARAMS_DICT['s_max'],
-        max_accel=PARAMS_DICT['a_max'],
-        LIDAR_FOV=LIDAR_FOV,
-        num_beams=NUM_BEAMS,
-        horizon=8,
-        speed_scale=0.8,
-        emergency_dist=0.8,
-        speed_clamp=7.5
-    )
+    if verbose:
+        print(f"  [Pretrained] Loaded expert — {E} env workers "
+              f"({N_total} agents batched, {E} CPU cores)")
 
-    poses = generate_start_poses(map_name, total_agents)
-    obs, _, _, _ = env.reset(poses=poses)
+    # LSTM hidden states spanning all envs × agents
+    obs_buffer = expert_model.create_observation_buffer(N_total, device)
+    hidden_h, hidden_c = expert_model.get_init_hidden(
+        N_total, device, transpose=True)
 
-    collision_timers = np.zeros(total_agents, dtype=np.int32)
+    # ── Step loop ────────────────────────────────────────────────────
+    demos: list[dict] = []
 
     for step in range(steps_per_map):
-        # Prepare inputs for pretrained model
-        scans_np = np.array(obs["scans"], dtype=np.float32)
-        states_np = np.stack([
-            obs["linear_vels_x"],
-            obs["linear_vels_y"],
-            obs["ang_vels_z"],
-            obs["linear_accel_x"],
-        ], axis=1).astype(np.float32)
-        
-        scan_tensor = torch.from_numpy(scans_np).unsqueeze(1).to(device)  # (N, 1, beams)
-        state_tensor = torch.from_numpy(states_np).to(device)  # (N, 4)
-        
-        # Get actions from pretrained LSTM model (requires hidden states)
+        # 1. Batch observations from all envs → GPU forward pass
+        batch_scans = np.concatenate(all_scans, axis=0)
+        batch_s4d = np.concatenate(all_s4d, axis=0)
+
+        scan_t = torch.from_numpy(batch_scans).unsqueeze(1).to(device)
+        state_t = torch.from_numpy(batch_s4d).to(device)
+
         with torch.no_grad():
-            loc, scale, obs_buffer, hidden_h, hidden_c = expert_model(
-                scan_tensor, state_tensor, obs_buffer, hidden_h, hidden_c
-            )
-            # Use mean (deterministic) actions for expert demos
-            expert_actions = loc.cpu().numpy()
-        
-        # MPC actions for noise agents
-        noise_actions = noise_mpc.get_actions_batch(obs)
-        
-        # Combine: use pretrained model for demo agents, MPC for noise agents
-        actions = expert_actions.copy()
-        actions[num_agents:] = noise_actions[:num_noise_agents]
-        # Last 3 noise agents act as static obstacles
-        actions[-3:] = np.array([0.0, 0.0])
-        
-        next_obs, _, _, _ = env.step(actions)
+            loc, _, obs_buffer, hidden_h, hidden_c = expert_model(
+                scan_t, state_t, obs_buffer, hidden_h, hidden_c)
+            expert_actions_all = loc.cpu().numpy()
 
-        # Collision / stuck detection
-        collisions = np.array(next_obs["collisions"])
-        velocities = np.array(next_obs["linear_vels_x"])
+        # 2. Send actions to ALL workers (they step in parallel)
+        for e, conn in enumerate(parent_conns):
+            off = e * total_agents
+            conn.send(expert_actions_all[off:off + total_agents])
 
-        for a_idx in range(num_agents):
-            scan_np = np.asarray(obs["scans"][a_idx], dtype=np.float32)
-            state_np = np.array([
-                obs["linear_vels_x"][a_idx],
-                obs["linear_vels_y"][a_idx],
-                obs["ang_vels_z"][a_idx],
-                obs["linear_accel_x"][a_idx],
-            ], dtype=np.float32)
-            action_np = actions[a_idx].astype(np.float32)
+        # 3. Receive results from all workers
+        new_scans, new_s3d, new_s4d = [], [], []
+        for e, conn in enumerate(parent_conns):
+            tag, scans, s3d, s4d, demo_meta, reset_all = conn.recv()
+            acts, vels, cols, reset_demo = demo_meta
+            off = e * total_agents
 
-            demos.append({
-                "scan":   scan_np,
-                "state":  state_np,
-                "action": action_np,
-                "map":    map_name,
-                "step":   step,
-                "agent":  a_idx,
-                "next_velocity":  float(velocities[:num_agents][a_idx]),
-                "next_collision": int(collisions[:num_agents][a_idx]),
-            })
+            # Save demos (using pre-step obs)
+            for a_idx in range(num_agents):
+                demos.append({
+                    "scan":   all_scans[e][a_idx].copy(),
+                    "state":  all_s3d[e][a_idx].copy(),
+                    "action": acts[a_idx],
+                    "map":    map_names[e],
+                    "step":   step,
+                    "agent":  a_idx,
+                    "next_velocity":  float(vels[a_idx]),
+                    "next_collision": int(cols[a_idx]),
+                    "done": int(a_idx in reset_demo),
+                })
 
-        # Stuck detection → reset
-        stuck = (collisions == 1) | (np.abs(velocities) < 0.1)
-        collision_timers[stuck] += 1
-        collision_timers[~stuck] = 0
+            # Reset LSTM hidden states for reset agents
+            for idx in reset_all:
+                g = off + idx
+                obs_buffer[g] = 0.0
+                hidden_h[g] = 0.0
+                hidden_c[g] = 0.0
 
-        to_reset = np.where(collision_timers >= collision_reset_threshold)[0]
-        if len(to_reset) > 0:
-            cur_poses = np.stack([
-                next_obs["poses_x"], next_obs["poses_y"], next_obs["poses_theta"]
-            ], axis=1)
-            new_poses = generate_start_poses(map_name, total_agents, agent_poses=cur_poses)
-            next_obs, _, _, _ = env.reset(poses=new_poses, agent_idxs=to_reset)
-            collision_timers[to_reset] = 0
-            # Reset LSTM hidden states and observation buffer for reset agents
-            for idx in to_reset:
-                obs_buffer[idx] = 0.0
-                hidden_h[idx] = 0.0
-                hidden_c[idx] = 0.0
+            new_scans.append(scans)
+            new_s3d.append(s3d)
+            new_s4d.append(s4d)
 
-        obs = next_obs
+        all_scans = new_scans
+        all_s3d = new_s3d
+        all_s4d = new_s4d
 
-    env.close()
+        if verbose and step % 500 == 0:
+            print(f"    step {step}/{steps_per_map}  "
+                  f"demos={len(demos)}", flush=True)
+
+    # ── Shutdown workers ─────────────────────────────────────────────
+    for conn in parent_conns:
+        conn.send(None)
+        conn.close()
+    for p in workers:
+        p.join(timeout=5)
+        if p.is_alive():
+            p.terminate()
+
     return demos
 
 
@@ -434,39 +526,41 @@ def collect_demos_pretrained(
     num_agents: int = 4,
     steps_per_map: int = 2000,
     collision_reset_threshold: int = 32,
-    max_workers: int | None = None,
+    concurrent_envs: int = 3,
     verbose: bool = True,
 ) -> list[dict]:
     """
     Collect demonstrations using a pretrained RecurrentActorNetwork from racing_rl
     across all *maps*.
 
-    Unlike the MPC-based collection, this uses the pretrained model to generate
-    expert actions, allowing the new model to learn from a warmed-up policy.
-
-    NOTE: Due to CUDA context issues with multiprocessing, this runs sequentially
-    on a single GPU. For parallel collection, use CPU or modify for spawn method.
+    Runs ``concurrent_envs`` gym environments simultaneously, batching all
+    agents into a single GPU forward pass per step for ~Nx speedup.
+    Maps are processed in groups of ``concurrent_envs``.
     """
     if verbose:
         print(f"\n[Demo] Collecting with pretrained model on {len(maps)} maps "
-              f"({num_agents} agents × {steps_per_map} steps each)")
+              f"({num_agents} agents × {steps_per_map} steps each, "
+              f"{concurrent_envs} concurrent envs)")
         print(f"       Model: {pretrained_model_path}")
 
     demos: list[dict] = []
 
-    # Sequential collection (CUDA doesn't play well with fork)
-    for map_name in maps:
+    # Process maps in batches of concurrent_envs
+    for batch_start in range(0, len(maps), concurrent_envs):
+        batch_maps = maps[batch_start:batch_start + concurrent_envs]
         try:
-            map_demos = _collect_single_map_pretrained(
-                map_name, pretrained_model_path, num_agents,
+            batch_demos = _collect_pretrained_batched(
+                batch_maps, pretrained_model_path, num_agents,
                 steps_per_map, collision_reset_threshold,
+                verbose=verbose,
             )
-            demos.extend(map_demos)
+            demos.extend(batch_demos)
             if verbose:
-                print(f"  ✓ {map_name}: {len(map_demos)} demos  (total so far: {len(demos)})")
+                print(f"  ✓ batch {batch_maps}: {len(batch_demos)} demos  "
+                      f"(total so far: {len(demos)})")
         except Exception as exc:
             import traceback
-            print(f"  ✗ {map_name} failed: {exc}")
+            print(f"  ✗ batch {batch_maps} failed: {exc}")
             traceback.print_exc()
 
     if verbose:
@@ -483,7 +577,6 @@ def pretrain(
     model_type: str = "lstm",
     epochs: int = 100,
     tbtt_length: int = 64,
-    checkpoint_every: int = 0,
     traj_batch_size: int = 8,
     lr: float = 3e-4,
     dispersive_lambda: float = 0.5,
@@ -505,22 +598,11 @@ def pretrain(
     sequentially in chunks of ``tbtt_length``, with hidden states detached
     at chunk boundaries to truncate gradient flow.
 
-    When ``checkpoint_every > 0``, activation checkpointing is used within
-    each TBTT window: the window is split into segments of
-    ``checkpoint_every`` steps and ``torch.utils.checkpoint`` recomputes
-    activations during backward instead of storing them.  Gradients still
-    flow across the **entire** TBTT window (hidden states are NOT detached
-    between checkpoint segments) — only the TBTT boundary performs
-    detachment.  This lets you set a very large ``tbtt_length`` (e.g. 7000)
-    while keeping peak memory proportional to ``checkpoint_every``.
     """
-    from torch.utils.checkpoint import checkpoint as torch_checkpoint
-
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"\n[Pretrain] Device: {device}")
-    ckpt_str = f", checkpoint_every={checkpoint_every}" if checkpoint_every > 0 else ""
     print(f"[Pretrain] {len(demos)} demos, {epochs} epochs, tbtt={tbtt_length}, "
-          f"traj_batch={traj_batch_size}{ckpt_str}, lr={lr}")
+          f"traj_batch={traj_batch_size}, lr={lr}")
 
     # ── Build model ──────────────────────────────────────────────────
     if model_type == "lstm":
@@ -528,7 +610,7 @@ def pretrain(
                     state_dim=STATE_DIM,
                     action_dim=2,
                     num_diffusion_steps=num_diffusion_steps,
-                    inference_steps=1,          # DDIM fast sampling for rollout/deploy
+                    inference_steps=0,          # DDIM fast sampling for rollout/deploy
                     time_emb_dim=32,
                     hidden_dims=(128, 128),
                     beta_schedule="cosine",
@@ -544,19 +626,17 @@ def pretrain(
                     state_dim=STATE_DIM,
                     action_dim=2,
                     num_diffusion_steps=num_diffusion_steps,
-                    inference_steps=1,          # DDIM fast sampling for rollout/deploy
-                    obs_feature_dim=16,
+                    inference_steps=0,          # DDIM fast sampling for rollout/deploy
+                    obs_feature_dim=256,
                     time_emb_dim=32,
-                    hidden_dims=(128, 128),
+                    hidden_dims=(256, 256),
                     beta_schedule="cosine",
-                    d_model=16,
-                    d_state=16,
+                    d_model=256,
+                    d_state=128,
                     d_conv=4,
-                    d_head=8,
+                    d_head=32,
                     expand=2,
-                    memory_length=128,          # placeholder — resized per traj batch
-                    memory_stride=55,
-                    odom_expand=32,
+                    odom_expand=64,
                 ).to(device)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
@@ -566,7 +646,6 @@ def pretrain(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     # ── Build trajectory tensors for TBTT ────────────────────────────
     from collections import defaultdict
@@ -577,68 +656,20 @@ def pretrain(
     for key in traj_dict:
         traj_dict[key].sort(key=lambda x: x.get("step", 0))
 
-    traj_data = []  # list of (scans_T, states_T, actions_T) per trajectory
+    traj_data = []  # list of (scans_T, states_T, actions_T, dones_T) per trajectory
     for key, traj in traj_dict.items():
         if len(traj) < 10:
             continue
         scans  = torch.stack([torch.from_numpy(d["scan"]) for d in traj]).unsqueeze(1).to(device)
         states = torch.stack([torch.from_numpy(d["state"]) for d in traj]).to(device)
         actions = torch.stack([torch.from_numpy(d["action"]) for d in traj]).to(device)
-        traj_data.append((scans, states, actions))
+        dones  = torch.tensor([d.get("done", 0) for d in traj], dtype=torch.float32, device=device)
+        traj_data.append((scans, states, actions, dones))
 
     num_trajs = len(traj_data)
     total_steps = sum(t[0].shape[0] for t in traj_data)
     print(f"[Pretrain] {num_trajs} trajectories, {total_steps} total steps, "
-          f"TBTT shifts={tbtt_length} (×stride per batch), traj_batch={traj_batch_size}")
-
-    # ── Helper: process a segment of timesteps (used by checkpoint) ──
-    def _actor_segment_fn(obs_buffer, hidden_h, hidden_c,
-                          scans_seg, states_seg, actions_seg):
-        """Forward through a segment, returning (diff, disp, obs_buffer, h, c).
-        Encodes observations sequentially (buffer dependency), then
-        batches the diffusion + dispersive losses for GPU efficiency.
-        Captured from closure: model, model_type, dispersive_temperature."""
-        seg_len = scans_seg.shape[0]
-        obs_features_list = []
-        for t in range(seg_len):
-            if model_type == "lstm":
-                obs_feat, obs_buffer, hidden_h, hidden_c = \
-                    model.encode_observation(
-                        scans_seg[t], states_seg[t], obs_buffer,
-                        hidden_h, hidden_c,
-                    )
-            else:
-                obs_feat, obs_buffer = model.encode_observation(
-                    scans_seg[t], states_seg[t], obs_buffer,
-                )
-            obs_features_list.append(obs_feat)
-
-        # Batch diffusion loss (one MLP call for all timesteps)
-        B_per_step = obs_features_list[0].shape[0]
-        all_obs_feats = torch.cat(obs_features_list, dim=0)
-        all_actions = actions_seg.reshape(-1, actions_seg.shape[-1])
-        seg_diff = model.compute_diffusion_loss(all_actions, all_obs_feats)
-
-        # Dispersive loss: chunk hooked features back to per-timestep
-        # groups (size B) to avoid O(N²) pairwise memory blow-up.
-        raw_feats = model.denoise_net.get_intermediate_features()
-        feat_items = raw_feats.values() if isinstance(raw_feats, dict) else raw_feats
-        seg_disp = torch.tensor(0.0, device=device)
-        if feat_items:
-            n_feats = 0
-            for feats in feat_items:
-                if feats.ndim > 2:
-                    feats = feats.mean(
-                        dim=list(range(1, feats.ndim - 1)))
-                # feats is (seg_len * B, dim) — chunk back to (seg_len, B, dim)
-                for chunk_f in feats.split(B_per_step, dim=0):
-                    seg_disp = seg_disp + dispersive_loss_infonce_l2(
-                        chunk_f, dispersive_temperature)
-                n_feats += seg_len
-            seg_disp = seg_disp / n_feats
-        return seg_diff, seg_disp, obs_buffer, hidden_h, hidden_c
-
-    use_ckpt = checkpoint_every > 0
+          f"tbtt={tbtt_length}, traj_batch={traj_batch_size}")
 
     # ── Training with TBTT ───────────────────────────────────────────
     os.makedirs(save_dir, exist_ok=True)
@@ -661,31 +692,19 @@ def pretrain(
             T = min(t[0].shape[0] for t in batch_trajs)
 
             # Stack trajectories into time-first layout: (T, B, ...)
-            scans_tb  = torch.stack([sc[:T] for sc, _, _ in batch_trajs], dim=1)
-            states_tb = torch.stack([st[:T] for _, st, _ in batch_trajs], dim=1)
-            actions_tb = torch.stack([ac[:T] for _, _, ac in batch_trajs], dim=1)
+            scans_tb  = torch.stack([sc[:T] for sc, _, _, _ in batch_trajs], dim=1)
+            states_tb = torch.stack([st[:T] for _, st, _, _ in batch_trajs], dim=1)
+            actions_tb = torch.stack([ac[:T] for _, _, ac, _ in batch_trajs], dim=1)
+            dones_tb  = torch.stack([dn[:T] for _, _, _, dn in batch_trajs], dim=1)  # (T, B)
 
-            # Dynamic buffer: mem_len = T // stride (matches train.py)
-            if model_type == "mamba2":
-                mem_len = max(T // model.memory_stride, 16)
-                model.memory_length = mem_len
-
-            # Scale TBTT to cover meaningful buffer shifts.
-            # With stride=50, raw tbtt_length=64 gives only 1.3 shifts —
-            # far too few for temporal gradient flow.  Multiply by stride
-            # so the user-supplied value means "desired buffer shifts".
-            if model_type == "mamba2":
-                effective_tbtt = min(tbtt_length * model.memory_stride, T)
-            else:
-                effective_tbtt = min(tbtt_length, T)
+            effective_tbtt = min(tbtt_length, T)
 
             # Initialise temporal state for this trajectory batch
             if model_type == "lstm":
                 hidden_h, hidden_c = model.get_init_hidden(B, device, transpose=True)
+                obs_buffer = model.create_observation_buffer(B, device)
             else:
-                hidden_h = torch.empty(0, device=device)
-                hidden_c = torch.empty(0, device=device)
-            obs_buffer = model.create_observation_buffer(B, device)
+                conv_state, ssm_state = model.allocate_state(B, device)
 
             # TBTT: process in chunks, detaching hidden state at boundaries
             for chunk_start in range(0, T, effective_tbtt):
@@ -695,111 +714,70 @@ def pretrain(
                 if model_type == "lstm":
                     hidden_h = hidden_h.detach()
                     hidden_c = hidden_c.detach()
-                obs_buffer = obs_buffer.detach().requires_grad_()
+                    obs_buffer = obs_buffer.detach().requires_grad_()
+                else:
+                    conv_state = conv_state.detach()
+                    ssm_state = ssm_state.detach()
 
                 chunk_diff = torch.tensor(0.0, device=device)
                 chunk_disp = torch.tensor(0.0, device=device)
                 chunk_len = chunk_end - chunk_start
 
-                if use_ckpt:
-                    # ── Activation-checkpointed path ────────────────
-                    # Split TBTT window into small segments; gradient
-                    # flows across the full window but activations are
-                    # recomputed per segment during backward.
-                    num_segments = 0
-                    for seg_start in range(chunk_start, chunk_end,
-                                          checkpoint_every):
-                        seg_end = min(seg_start + checkpoint_every,
-                                      chunk_end)
-                        scans_seg   = scans_tb[seg_start:seg_end]
-                        states_seg  = states_tb[seg_start:seg_end]
-                        actions_seg = actions_tb[seg_start:seg_end]
-                        seg_len = seg_end - seg_start
+                for t in range(chunk_start, chunk_end):
+                    # Reset temporal state for trajectories that
+                    # had a done at the previous step.
+                    if t > 0 and dones_tb[t - 1].any():
+                        reset_idx = dones_tb[t - 1].nonzero(
+                            as_tuple=False).squeeze(-1)
+                        if model_type == "lstm":
+                            hidden_h[reset_idx] = 0.0
+                            hidden_c[reset_idx] = 0.0
+                            obs_buffer[reset_idx] = 0.0
+                        else:
+                            conv_state[reset_idx] = 0.0
+                            ssm_state[reset_idx] = 0.0
 
-                        with torch.amp.autocast("cuda",
-                                    enabled=(device.type == "cuda")):
-                            sd, sp, obs_buffer, hidden_h, hidden_c = \
-                                torch_checkpoint(
-                                    _actor_segment_fn,
-                                    obs_buffer, hidden_h, hidden_c,
-                                    scans_seg, states_seg, actions_seg,
-                                    use_reentrant=False,
-                                )
-                        # Weight segment means by their length for
-                        # correct averaging across unequal segments.
-                        chunk_diff = chunk_diff + sd * seg_len
-                        chunk_disp = chunk_disp + sp * seg_len
-                        num_segments += seg_len
-                    # Convert weighted sums to means
-                    chunk_diff = chunk_diff / num_segments
-                    chunk_disp = chunk_disp / num_segments
-                else:
-                    # ── Standard (non-checkpointed) path ────────────
-                    # Encode observations sequentially (buffer dependency),
-                    # then batch the diffusion + dispersive loss for GPU
-                    # efficiency (one large MLP call instead of thousands
-                    # of tiny per-timestep calls).
-                    obs_features_list = []
-                    with torch.amp.autocast("cuda",
-                                enabled=(device.type == "cuda")):
-                        for t in range(chunk_start, chunk_end):
-                            if model_type == "lstm":
-                                obs_feat, obs_buffer, hidden_h, \
-                                    hidden_c = \
-                                    model.encode_observation(
-                                        scans_tb[t], states_tb[t],
-                                        obs_buffer, hidden_h, hidden_c,
-                                    )
-                            else:
-                                obs_feat, obs_buffer = \
-                                    model.encode_observation(
-                                        scans_tb[t], states_tb[t],
-                                        obs_buffer,
-                                    )
-                            obs_features_list.append(obs_feat)
+                    if model_type == "lstm":
+                        obs_feat, obs_buffer, hidden_h, \
+                            hidden_c = \
+                            model.encode_observation(
+                                scans_tb[t], states_tb[t],
+                                obs_buffer, hidden_h, hidden_c,
+                            )
+                    else:
+                        obs_feat, conv_state, ssm_state = \
+                            model.encode_observation(
+                                scans_tb[t], states_tb[t],
+                                conv_state, ssm_state,
+                            )
+                    diff_loss = model.compute_diffusion_loss(
+                        actions_tb[t], obs_feat)
+                    feat_list = model.denoise_net \
+                        .get_intermediate_features()
+                    disp_loss = torch.tensor(0.0, device=device)
+                    if feat_list:
+                        for feats in feat_list:
+                            if feats.ndim > 2:
+                                feats = feats.mean(
+                                    dim=list(range(
+                                        1, feats.ndim - 1)))
+                            disp_loss = disp_loss + \
+                                dispersive_loss_infonce_l2(
+                                    feats,
+                                    dispersive_temperature)
+                        disp_loss = disp_loss / len(feat_list)
+                    chunk_diff = chunk_diff + diff_loss
+                    chunk_disp = chunk_disp + disp_loss
 
-                        # Batch diffusion loss: one denoiser MLP call
-                        B_per_step = obs_features_list[0].shape[0]
-                        all_obs_feats = torch.cat(obs_features_list, dim=0)
-                        all_actions = actions_tb[chunk_start:chunk_end] \
-                            .reshape(-1, actions_tb.shape[-1])
-                        chunk_diff = model.compute_diffusion_loss(
-                            all_actions, all_obs_feats)
-
-                        # Dispersive loss: chunk hooked features back
-                        # to per-timestep groups (size B) to avoid
-                        # O(N²) pairwise memory blow-up.
-                        raw_feats = model.denoise_net \
-                            .get_intermediate_features()
-                        feat_items = raw_feats.values() \
-                            if isinstance(raw_feats, dict) else raw_feats
-                        if feat_items:
-                            n_feats = 0
-                            for feats in feat_items:
-                                if feats.ndim > 2:
-                                    feats = feats.mean(
-                                        dim=list(range(
-                                            1, feats.ndim - 1)))
-                                for chunk_f in feats.split(
-                                        B_per_step, dim=0):
-                                    chunk_disp = chunk_disp + \
-                                        dispersive_loss_infonce_l2(
-                                            chunk_f,
-                                            dispersive_temperature)
-                                n_feats += chunk_len
-                            chunk_disp = chunk_disp / n_feats
-
-                # chunk_diff / chunk_disp are already mean losses; scale for grad accumulation
-                avg_chunk_loss = chunk_diff + dispersive_lambda * chunk_disp
-                scaler.scale(
-                    avg_chunk_loss / gradient_accumulation_steps).backward()
+                # Average over timesteps in chunk, scale for grad accumulation
+                avg_chunk_loss = (
+                    chunk_diff + dispersive_lambda * chunk_disp) / chunk_len
+                (avg_chunk_loss / gradient_accumulation_steps).backward()
 
                 chunk_count += 1
                 if chunk_count % gradient_accumulation_steps == 0:
-                    scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
                 epoch_diff += chunk_diff.item()
@@ -815,10 +793,8 @@ def pretrain(
 
         # Flush remaining accumulated gradients
         if chunk_count % gradient_accumulation_steps != 0:
-            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         scheduler.step()
@@ -863,12 +839,11 @@ def pretrain_critic(
     model_type: str = "lstm",
     epochs: int = 30,
     tbtt_length: int = 64,
-    checkpoint_every: int = 0,
     traj_batch_size: int = 8,
     lr: float = 5e-4,
-    gamma: float = 0.999,
+    gamma: float = 0.99,
     speed_reward_scale: float = 0.10,
-    collision_penalty: float = -4.0,
+    collision_penalty: float = -5.0,
     save_dir: str = "models/critic/pretrained",
     save_name: str = "critic_pretrained.pt",
     device: str | torch.device = "cuda",
@@ -897,9 +872,7 @@ def pretrain_critic(
     print("  CRITIC PRE-TRAINING  (weight_initializer)")
     print(f"{'=' * 60}")
     print(f"  {len(demos)} demos, {epochs} epochs, tbtt={tbtt_length}, "
-          f"traj_batch={traj_batch_size}, "
-          f"{'ckpt=' + str(checkpoint_every) + ', ' if checkpoint_every > 0 else ''}"
-          f"lr={lr}, γ={gamma}")
+          f"traj_batch={traj_batch_size}, lr={lr}, γ={gamma}")
 
     has_reward_fields = ("next_velocity" in demos[0])
     if not has_reward_fields:
@@ -942,13 +915,11 @@ def pretrain_critic(
         critic = Mamba2CriticNetwork(
             state_dim=STATE_DIM,
             encoder=encoder,
-            d_model=16,
-            d_state=16,
+            d_model=256,
+            d_state=128,
             d_conv=4,
-            d_head=8,
+            d_head=32,
             expand=2,
-            memory_length=128,
-            memory_stride=50,
             odom_expand=64,
         ).to(device)
     else:
@@ -970,7 +941,7 @@ def pretrain_critic(
     for key in trajectories:
         trajectories[key].sort(key=lambda x: x.get("step", 0))
 
-    traj_data_c = []  # list of (scans, states, returns) per trajectory
+    traj_data_c = []  # list of (scans, states, returns, dones) per trajectory
 
     for (map_name, agent_idx), traj in trajectories.items():
         T = len(traj)
@@ -979,6 +950,7 @@ def pretrain_critic(
 
         scans  = torch.stack([torch.from_numpy(d["scan"]) for d in traj]).unsqueeze(1).to(device)
         states = torch.stack([torch.from_numpy(d["state"]) for d in traj]).to(device)
+        dones  = torch.tensor([d.get("done", 0) for d in traj], dtype=torch.float32, device=device)
 
         # Compute per-step rewards
         rewards = torch.zeros(T)
@@ -991,54 +963,30 @@ def pretrain_critic(
                 col = 0
             rewards[t] = vel * speed_reward_scale + col * collision_penalty
 
-        # Normalise rewards per trajectory
+        # Normalise rewards per trajectory (zero-mean unit-variance)
+        r_mean = rewards.mean()
         r_std = rewards.std().clamp(min=1e-4)
-        rewards = rewards / r_std
+        rewards = (rewards - r_mean) / r_std
 
-        # MC returns (reverse cumsum)
+        # MC returns (reverse cumsum), reset at episode boundaries
         returns = torch.zeros(T)
         G = 0.0
         for t in reversed(range(T)):
-            G = rewards[t] + gamma * G
+            G = rewards[t] + gamma * G * (1.0 - dones[t].item())
             returns[t] = G
 
-        traj_data_c.append((scans, states, returns.to(device)))
+        traj_data_c.append((scans, states, returns.to(device), dones))
 
     num_trajs_c = len(traj_data_c)
     total_steps_c = sum(t[0].shape[0] for t in traj_data_c)
     print(f"  {num_trajs_c} trajectories, {total_steps_c} steps, "
-          f"TBTT shifts={tbtt_length} (×stride per batch), traj_batch={traj_batch_size}")
+          f"tbtt={tbtt_length}, traj_batch={traj_batch_size}")
 
     # ── 3. TBTT training ────────────────────────────────────────────
-    from torch.utils.checkpoint import checkpoint as torch_checkpoint
-
-    def _critic_segment_fn(obs_buffer, hidden_h, hidden_c,
-                           scans_seg, states_seg, returns_seg):
-        """Forward through a critic segment.
-        Captured from closure: critic, model_type."""
-        seg_len = scans_seg.shape[0]
-        seg_loss = torch.tensor(0.0, device=scans_seg.device)
-        for t in range(seg_len):
-            if model_type == "lstm":
-                feat, obs_buffer, hidden_h, hidden_c = \
-                    critic.encode_observation(
-                        scans_seg[t], states_seg[t], obs_buffer,
-                        hidden_h, hidden_c,
-                    )
-            else:
-                feat, obs_buffer = critic.encode_observation(
-                    scans_seg[t], states_seg[t], obs_buffer,
-                )
-            pred = critic.fc_layers(feat).squeeze(-1)
-            seg_loss = seg_loss + F.smooth_l1_loss(pred, returns_seg[t])
-        return seg_loss, obs_buffer, hidden_h, hidden_c
-
-    use_ckpt = checkpoint_every > 0
-
     critic.train()
     optim_c = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, critic.parameters()),
-        lr=lr, weight_decay=0.01,
+        lr=lr, weight_decay=0,
     )
 
     best_loss = float("inf")
@@ -1056,28 +1004,19 @@ def pretrain_critic(
             T = min(t[0].shape[0] for t in batch_trajs)
 
             # Stack into time-first layout
-            scans_tb   = torch.stack([sc[:T] for sc, _, _ in batch_trajs], dim=1)
-            states_tb  = torch.stack([st[:T] for _, st, _ in batch_trajs], dim=1)
-            returns_tb = torch.stack([ret[:T] for _, _, ret in batch_trajs], dim=1)
+            scans_tb   = torch.stack([sc[:T] for sc, _, _, _ in batch_trajs], dim=1)
+            states_tb  = torch.stack([st[:T] for _, st, _, _ in batch_trajs], dim=1)
+            returns_tb = torch.stack([ret[:T] for _, _, ret, _ in batch_trajs], dim=1)
+            dones_tb   = torch.stack([dn[:T] for _, _, _, dn in batch_trajs], dim=1)  # (T, B)
 
-            # Dynamic buffer: mem_len = T // stride (matches train.py)
-            if model_type == "mamba2":
-                mem_len = max(T // critic.memory_stride, 16)
-                critic.memory_length = mem_len
-
-            # Scale TBTT by stride for Mamba2 (see actor pretrain comment)
-            if model_type == "mamba2":
-                effective_tbtt = min(tbtt_length * critic.memory_stride, T)
-            else:
-                effective_tbtt = min(tbtt_length, T)
+            effective_tbtt = min(tbtt_length, T)
 
             # Initialise temporal state
             if model_type == "lstm":
                 hidden_h, hidden_c = critic.get_init_hidden(B, device, transpose=True)
+                obs_buffer = critic.create_observation_buffer(B, device)
             else:
-                hidden_h = torch.empty(0, device=device)
-                hidden_c = torch.empty(0, device=device)
-            obs_buffer = critic.create_observation_buffer(B, device)
+                conv_state, ssm_state = critic.allocate_state(B, device)
 
             # Process in TBTT chunks
             for chunk_start in range(0, T, effective_tbtt):
@@ -1086,41 +1025,43 @@ def pretrain_critic(
                 if model_type == "lstm":
                     hidden_h = hidden_h.detach()
                     hidden_c = hidden_c.detach()
-                obs_buffer = obs_buffer.detach().requires_grad_()
+                    obs_buffer = obs_buffer.detach().requires_grad_()
+                else:
+                    conv_state = conv_state.detach()
+                    ssm_state = ssm_state.detach()
 
                 chunk_loss = torch.tensor(0.0, device=device)
                 chunk_len = chunk_end - chunk_start
 
-                if use_ckpt:
-                    for seg_start in range(chunk_start, chunk_end,
-                                          checkpoint_every):
-                        seg_end = min(seg_start + checkpoint_every,
-                                      chunk_end)
-                        sl, obs_buffer, hidden_h, hidden_c = \
-                            torch_checkpoint(
-                                _critic_segment_fn,
-                                obs_buffer, hidden_h, hidden_c,
-                                scans_tb[seg_start:seg_end],
-                                states_tb[seg_start:seg_end],
-                                returns_tb[seg_start:seg_end],
-                                use_reentrant=False,
-                            )
-                        chunk_loss = chunk_loss + sl
-                else:
-                    for t in range(chunk_start, chunk_end):
+                for t in range(chunk_start, chunk_end):
+                    # Reset temporal state for trajectories that
+                    # had a done at the previous step.
+                    if t > 0 and dones_tb[t - 1].any():
+                        reset_idx = dones_tb[t - 1].nonzero(
+                            as_tuple=False).squeeze(-1)
                         if model_type == "lstm":
-                            feat, obs_buffer, hidden_h, hidden_c = \
-                                critic.encode_observation(
-                                    scans_tb[t], states_tb[t],
-                                    obs_buffer, hidden_h, hidden_c,
-                                )
+                            hidden_h[reset_idx] = 0.0
+                            hidden_c[reset_idx] = 0.0
+                            obs_buffer[reset_idx] = 0.0
                         else:
-                            feat, obs_buffer = critic.encode_observation(
-                                scans_tb[t], states_tb[t], obs_buffer,
+                            conv_state[reset_idx] = 0.0
+                            ssm_state[reset_idx] = 0.0
+
+                    if model_type == "lstm":
+                        feat, obs_buffer, hidden_h, hidden_c = \
+                            critic.encode_observation(
+                                scans_tb[t], states_tb[t],
+                                obs_buffer, hidden_h, hidden_c,
                             )
-                        pred = critic.fc_layers(feat).squeeze(-1)
-                        chunk_loss = chunk_loss + F.smooth_l1_loss(
-                            pred, returns_tb[t])
+                    else:
+                        feat, conv_state, ssm_state = \
+                            critic.encode_observation(
+                                scans_tb[t], states_tb[t],
+                                conv_state, ssm_state,
+                            )
+                    pred = critic.fc_layers(feat).squeeze(-1)
+                    chunk_loss = chunk_loss + F.smooth_l1_loss(
+                        pred, returns_tb[t])
 
                 avg_loss = chunk_loss / chunk_len
                 optim_c.zero_grad(set_to_none=True)
@@ -1175,7 +1116,7 @@ def main():
     parser.add_argument("--completable_only", action="store_true",
                         help="Only use maps the racing_rl agent can complete "
                              "(Catalunya, Sepang). Overrides --maps.")
-    parser.add_argument("--num_agents", type=int, default=2,
+    parser.add_argument("--num_agents", type=int, default=3,
                         help="Agents per env during collection")
     parser.add_argument("--steps_per_map", type=int, default=7000,
                         help="Env steps per map during collection")
@@ -1185,19 +1126,16 @@ def main():
                         help="Path to a saved demos .pt file (skip collection)")
     parser.add_argument("--save_demos", type=str, default="demos/expert_demos.pt",
                         help="Where to save collected demos for reuse")
-    parser.add_argument("--pretrained_expert", type=str, default=None,
+    parser.add_argument("--pretrained_expert", type=str, default="../racing_rl/actor_val_best.pt",
                         help="Path to pretrained model (.pt) from racing_rl to use as expert "
                              "(default: None, uses MPC as expert)")
     # Actor training
-    parser.add_argument("--model_type", type=str, default="lstm", choices=["lstm", "mamba2"],
+    parser.add_argument("--model_type", type=str, default="mamba2", choices=["lstm", "mamba2"],
                         help="Network architecture backbone (lstm or mamba2)")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--tbtt_length", type=int, default=55,
-                        help="TBTT window in buffer shifts (multiplied by stride for Mamba2)")
-    parser.add_argument("--checkpoint_every", type=int, default=0,
-                        help="Activation checkpoint segment size inside TBTT window "
-                             "(0=off, e.g. 64 for memory saving with large tbtt_length)")
-    parser.add_argument("--traj_batch_size", type=int, default=6,
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--tbtt_length", type=int, default=512,
+                        help="TBTT window length (number of timesteps per chunk)")
+    parser.add_argument("--traj_batch_size", type=int, default=9,
                         help="Number of trajectories to process in parallel")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--dispersive_lambda", type=float, default=0.5)
@@ -1208,7 +1146,7 @@ def main():
     parser.add_argument("--save_name", type=str, default="actor_pretrained.pt")
     # Critic pretraining
     parser.add_argument("--critic_epochs", type=int, default=30)
-    parser.add_argument("--critic_lr", type=float, default=5e-4)
+    parser.add_argument("--critic_lr", type=float, default=1e-4)
     parser.add_argument("--critic_save_dir", type=str, default="models/critic/pretrained")
     parser.add_argument("--critic_save_name", type=str, default="critic_pretrained.pt")
     parser.add_argument("--skip_critic", action="store_true",
@@ -1257,7 +1195,6 @@ def main():
         model_type=args.model_type,
         epochs=args.epochs,
         tbtt_length=args.tbtt_length,
-        checkpoint_every=args.checkpoint_every,
         traj_batch_size=args.traj_batch_size,
         lr=args.lr,
         dispersive_lambda=args.dispersive_lambda,
@@ -1285,9 +1222,11 @@ def main():
         T_val = val_scans.shape[0]
         warmup = min(T_val - 8, 200)  # build temporal context over 200 steps
 
-        obs_buffer = model.create_observation_buffer(1, device)
         if args.model_type == "lstm":
+            obs_buffer = model.create_observation_buffer(1, device)
             hidden_h, hidden_c = model.get_init_hidden(1, device, transpose=True)
+        else:
+            conv_state, ssm_state = model.allocate_state(1, device)
 
         # Warm up temporal state with sequential observations
         for t in range(warmup):
@@ -1295,8 +1234,8 @@ def main():
                 obs_feat, obs_buffer, hidden_h, hidden_c = model.encode_observation(
                     val_scans[t:t+1], val_states[t:t+1], obs_buffer, hidden_h, hidden_c)
             else:
-                obs_feat, obs_buffer = model.encode_observation(
-                    val_scans[t:t+1], val_states[t:t+1], obs_buffer)
+                obs_feat, conv_state, ssm_state = model.encode_observation(
+                    val_scans[t:t+1], val_states[t:t+1], conv_state, ssm_state)
 
         # Now evaluate on the next 8 steps with valid temporal context
         eval_start = warmup
@@ -1308,8 +1247,8 @@ def main():
                 obs_feat, obs_buffer, hidden_h, hidden_c = model.encode_observation(
                     val_scans[t:t+1], val_states[t:t+1], obs_buffer, hidden_h, hidden_c)
             else:
-                obs_feat, obs_buffer = model.encode_observation(
-                    val_scans[t:t+1], val_states[t:t+1], obs_buffer)
+                obs_feat, conv_state, ssm_state = model.encode_observation(
+                    val_scans[t:t+1], val_states[t:t+1], conv_state, ssm_state)
             act = model.sample_action(obs_feat, deterministic=True)
             sampled_list.append(act)
             expert_list.append(val_actions[t:t+1])
@@ -1334,7 +1273,6 @@ def main():
             model_type=args.model_type,
             epochs=args.critic_epochs,
             tbtt_length=args.tbtt_length,
-            checkpoint_every=args.checkpoint_every,
             traj_batch_size=args.traj_batch_size,
             lr=args.critic_lr,
             save_dir=args.critic_save_dir,

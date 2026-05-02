@@ -20,8 +20,18 @@ with open('analysis/race_data_race2.pkl', 'rb') as f:
 # with open('analysis/race_data_MPC_variable_speed3.pkl', 'rb') as f:
 #     mpc = pickle.load(f)
 
-race_data['TR Agent'] = race_data['SupervisedAgent']
-del race_data['SupervisedAgent']
+# Backwards compatibility: legacy pkls keyed agents by class name
+# (``SupervisedAgent``); the current paper_data_collection script keys
+# by explicit labels (``BC_LSTM``, ``D2PPO``).  Map either format to
+# human-friendly display names without breaking older data files.
+_LEGACY_RENAMES = {
+    "SupervisedAgent": "TR Agent",  # very old runs
+    "BC_LSTM":         "BC-LSTM",   # supervised baseline
+    "D2PPO":           "D²PPO",     # RL-trained actor
+}
+for _src, _dst in _LEGACY_RENAMES.items():
+    if _src in race_data and _dst not in race_data:
+        race_data[_dst] = race_data.pop(_src)
 # race_data['MPCAgent'] = mpc['MPCAgent_12.0']
 # race_data['GapFollow'] = gf['GapFollow']
 # del race_data['SupervisedAgent']

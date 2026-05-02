@@ -10,3 +10,5 @@ maps/gen_*
 maps/val_*
 maps/test_*
 maps/debug_*
+analysis/snapshots/*
+plots/results/*

@@ -661,3 +661,26 @@ class MPCAgent:
         for i in range(num_agents):
             actions[i] = self.get_action(obs, agent_idx=i)
         return actions
+
+    def get_speed_targets_batch(self, obs, num_agents=None):
+        """Fast curvature-safe speed targets — no MPC trajectory solve.
+
+        Only does nearest-waypoint lookup + curvature braking model.
+        ~50× cheaper than get_actions_batch (no LiDAR, no candidates).
+
+        Returns:
+            speeds: (num_agents,) array of curvature-safe speed targets
+        """
+        n = num_agents or len(obs['poses_x'])
+        cx = self.waypoints[:, 1]
+        cy = self.waypoints[:, 2]
+        traj = np.vstack((cx, cy)).T
+        speeds = np.empty(n)
+        for i in range(n):
+            pt = np.array([obs['poses_x'][i], obs['poses_y'][i]])
+            _, _, _, idx = self._get_nearest_point(pt, traj)
+            safe = self._compute_safe_speed(idx)
+            if self.speed_clamp is not None:
+                safe = min(safe, self.speed_clamp)
+            speeds[i] = safe
+        return speeds

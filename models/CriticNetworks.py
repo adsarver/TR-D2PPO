@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.AuxModels import VisionEncoder
-from mamba_ssm.modules.mamba2_simple import Mamba2Simple
+from mamba_ssm.modules.mamba2 import Mamba2
 
 class CriticNetwork(nn.Module):
     """
@@ -49,7 +49,6 @@ class CriticNetwork(nn.Module):
             [-5.0, 20.0],   # linear_vel_x
             [-5.0,  5.0],   # linear_vel_y
             [-15.0, 15.0],  # ang_vel_z
-            [-10.0, 10.0],  # linear_accel_x
         ]
         state_lo = torch.tensor([r[0] for r in default_ranges[:state_dim]], dtype=torch.float32)
         state_hi = torch.tensor([r[1] for r in default_ranges[:state_dim]], dtype=torch.float32)
@@ -204,7 +203,7 @@ class CriticNetwork(nn.Module):
 
 class Mamba2CriticNetwork(nn.Module):
     """
-    Mamba2-enhanced value network.
+    Mamba2-enhanced value network with recurrent SSM state.
     Mirrors the actor's temporal backbone (DiffusionMamba2) so the critic
     has comparable representational capacity for long-horizon returns.
     """
@@ -217,8 +216,6 @@ class Mamba2CriticNetwork(nn.Module):
         d_conv=4,
         d_head=16,
         expand=2,
-        memory_length=48,
-        memory_stride=1,
         odom_expand=64,
         num_scan_beams=1080,
     ):
@@ -229,18 +226,20 @@ class Mamba2CriticNetwork(nn.Module):
         conv_output_size = self.conv_layers.output_size
         
         # Memory configuration
-        self.memory_length = memory_length
-        self.memory_stride = memory_stride
-        self.step_counter = 0
         self.d_model = d_model
-        self._obs_buffer = None  # managed internally during inference
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        # Internal recurrent state managed during inference
+        self._conv_state = None
+        self._ssm_state = None
         
         # Odom handling — baked-in normalisation ranges
         default_ranges = [
             [-5.0, 20.0],   # linear_vel_x
             [-5.0,  5.0],   # linear_vel_y
             [-15.0, 15.0],  # ang_vel_z
-            [-10.0, 10.0],  # linear_accel_x
+
         ]
         state_lo = torch.tensor([r[0] for r in default_ranges[:state_dim]], dtype=torch.float32)
         state_hi = torch.tensor([r[1] for r in default_ranges[:state_dim]], dtype=torch.float32)
@@ -259,9 +258,9 @@ class Mamba2CriticNetwork(nn.Module):
             nn.ReLU(),
         )
 
-        # Mamba2Simple temporal backbone
+        # Mamba2 recurrent temporal backbone
         self.pre_mamba_norm = nn.LayerNorm(d_model)
-        self.mamba = Mamba2Simple(
+        self.mamba = Mamba2(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
@@ -279,46 +278,49 @@ class Mamba2CriticNetwork(nn.Module):
             nn.Linear(32, 1)
         )
     
-    def create_observation_buffer(self, batch_size, device):
-        """Create a buffer to store recent observations for Mamba input."""
-        self.step_counter = 0
-        return torch.zeros(batch_size, self.memory_length, self.d_model, device=device)
+    def allocate_state(self, batch_size, device):
+        """Allocate zero-initialised Mamba2 recurrent state."""
+        conv, ssm = self.mamba.allocate_inference_cache(batch_size, max_seqlen=1)
+        return conv.contiguous(), ssm.contiguous()
 
     def reset_temporal_state(self, agent_idxs=None):
-        """Reset the internal rolling feature buffer.
+        """Reset internal recurrent state.
 
         Args:
             agent_idxs: optional array of agent indices to reset.
-                        If None, resets all agents and the step counter.
+                        If None, resets all agents.
         """
-        if self._obs_buffer is None:
+        if self._conv_state is None:
             return
         if agent_idxs is None:
-            self._obs_buffer.zero_()
-            self.step_counter = 0
+            self._conv_state.zero_()
+            self._ssm_state.zero_()
         else:
-            self._obs_buffer[agent_idxs] = 0.0
+            self._conv_state[agent_idxs] = 0.0
+            self._ssm_state[agent_idxs] = 0.0
 
-    def encode_observation(self, scan_tensor, state_tensor, obs_buffer=None):
+    def encode_observation(self, scan_tensor, state_tensor,
+                           conv_state=None, ssm_state=None):
         """
-        Encode raw observations through CNN + Mamba2 temporal backbone.
+        Encode raw observations through CNN + Mamba2 recurrent step.
 
-        When *obs_buffer* is not supplied the network manages an internal
-        buffer and returns only ``critic_features``.  When an explicit buffer
-        is passed (TBTT training) the updated buffer is returned as well.
+        When *conv_state* / *ssm_state* are not supplied the network manages
+        internal state and returns only ``critic_features``.
+        When explicit states are passed (TBTT training) the updated states
+        are returned so the caller can detach them.
         """
         batch_size = scan_tensor.shape[0]
         device = scan_tensor.device
-        _using_internal = obs_buffer is None
+        _using_internal = conv_state is None
 
         if _using_internal:
-            if self._obs_buffer is None or self._obs_buffer.shape[0] != batch_size:
-                self._obs_buffer = self.create_observation_buffer(batch_size, device)
-            obs_buffer = self._obs_buffer
-        if obs_buffer.device != device:
-            obs_buffer = obs_buffer.to(device)
-
-        # Scan normalisation
+            if self._conv_state is None or self._conv_state.shape[0] != batch_size:
+                self._conv_state, self._ssm_state = self.allocate_state(batch_size, device)
+            conv_state = self._conv_state
+            ssm_state = self._ssm_state
+        if conv_state.device != device:
+            conv_state = conv_state.to(device).contiguous()
+            ssm_state = ssm_state.to(device).contiguous()
         scan_norm = scan_tensor.clamp(0.0, 10.0) / 10.0
 
         # CNN features
@@ -332,26 +334,21 @@ class Mamba2CriticNetwork(nn.Module):
         combined = torch.cat([vision_features, state_feat], dim=-1)
         projected = self.feature_projection(combined)
 
-        # Rolling buffer update (stride-aware)
-        self.step_counter += 1
-        if self.memory_stride <= 1 or self.step_counter % self.memory_stride == 0:
-            obs_buffer = torch.cat([
-                obs_buffer[:, 1:, :],
-                projected.unsqueeze(1),
-            ], dim=1)
-        else:
-            obs_buffer = obs_buffer.clone()
-            obs_buffer[:, -1, :] = projected
+        # Pre-norm and clamp
+        projected_normed = self.pre_mamba_norm(projected)
+        projected_normed = torch.clamp(projected_normed, -10.0, 10.0)
 
-        # Mamba2 temporal pass
-        obs_normed = self.pre_mamba_norm(obs_buffer)
-        mamba_out = self.mamba(obs_normed)
-        critic_features = self.norm_layer(mamba_out[:, -1, :])
+        # Mamba2 recurrent step
+        mamba_out, conv_state, ssm_state = self.mamba.step(
+            projected_normed.unsqueeze(1), conv_state, ssm_state
+        )
+        critic_features = self.norm_layer(mamba_out.squeeze(1))
 
         if _using_internal:
-            self._obs_buffer = obs_buffer
+            self._conv_state = conv_state
+            self._ssm_state = ssm_state
             return critic_features
-        return critic_features, obs_buffer
+        return critic_features, conv_state, ssm_state
 
     def forward_from_features(self, critic_features):
         """
@@ -360,12 +357,18 @@ class Mamba2CriticNetwork(nn.Module):
         """
         return self.fc_layers(critic_features)
 
-    def forward(self, scan_tensor, state_tensor, obs_buffer=None):
+    def forward(self, scan_tensor, state_tensor,
+                conv_state=None, ssm_state=None):
         """
         Full forward pass: encode observations then predict value.
         """
-        critic_features, obs_buffer = self.encode_observation(
-            scan_tensor, state_tensor, obs_buffer
+        result = self.encode_observation(
+            scan_tensor, state_tensor, conv_state, ssm_state
         )
-        value = self.fc_layers(critic_features)
-        return value, obs_buffer
+        if isinstance(result, tuple):
+            critic_features, conv_state, ssm_state = result
+            value = self.fc_layers(critic_features)
+            return value, conv_state, ssm_state
+        else:
+            value = self.fc_layers(result)
+            return value

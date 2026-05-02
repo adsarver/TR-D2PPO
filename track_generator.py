@@ -223,9 +223,11 @@ class TrackGenerator:
             cl_wr = np.interp(cl_s, fine_s, w_right)
             cl_wl = np.interp(cl_s, fine_s, w_left)
 
-            # 12. Render occupancy image
+            # 12. Render occupancy image (centerline + per-sample total
+            # widths are required by the disc-sweep filler so the
+            # racing surface stays connected at tight turns).
             img, origin, eff_res = self._render_occupancy(
-                left_bnd, right_bnd)
+                left_bnd, right_bnd, fine_xy, w_left + w_right)
 
             # 13. Write all files
             self._write_image(
@@ -438,11 +440,18 @@ class TrackGenerator:
     # Rendering
     # ─────────────────────────────────────────────────────────────
 
-    def _render_occupancy(self, left_boundary, right_boundary):
+    def _render_occupancy(self, left_boundary, right_boundary,
+                          centerline=None, total_widths=None):
         """Render the track as black wall lines on a white background.
 
         Matches the style of existing F1TENTH map PNGs (white = free space,
         black lines = walls along the track boundaries).
+
+        The racing surface is filled by sweeping a disc of diameter equal
+        to the local total track width along the centerline.  This is
+        robust to inner-boundary self-intersections at very tight turns,
+        which would otherwise produce un-filled lobes ("islands") inside
+        corners under PIL's even-odd polygon fill rule.
 
         Returns (PIL.Image, origin_list, effective_resolution).
         """
@@ -491,12 +500,37 @@ class TrackGenerator:
         for px, py in right_px:
             draw.ellipse([px - r, py - r, px + r, py + r], fill=0)
 
-        # Step 2: Fill the track interior with white.  This erases any
-        # triangular overlap artifacts at sharp turns where the inner
-        # boundary self-intersects, while preserving the outward-facing
-        # wall pixels.
-        corridor = left_px + list(reversed(right_px))
-        draw.polygon(corridor, fill=255)
+        # Step 2: Fill the track interior by sweeping a disc along the
+        # centerline with diameter = local total track width.  The union
+        # of discs is the racing surface; this is robust to inner-offset
+        # self-intersection at apex of tight turns (which would leave a
+        # black island inside the corner under polygon even-odd fill).
+        if centerline is not None and total_widths is not None:
+            cl_arr = np.asarray(centerline, dtype=float)
+            tw_arr = np.asarray(total_widths, dtype=float)
+            center_px = to_px(cl_arr)
+            min_rad_px = max(2.0, 0.4 / res)  # never below 0.4 m equiv
+            for (cx, cy), w in zip(center_px, tw_arr):
+                rad = max(min_rad_px, (float(w) / 2.0) / res)
+                draw.ellipse(
+                    [cx - rad, cy - rad, cx + rad, cy + rad],
+                    fill=255,
+                )
+        else:
+            # Backwards-compatible fallback (legacy callers).
+            corridor = left_px + list(reversed(right_px))
+            draw.polygon(corridor, fill=255)
+
+        # Step 3: Re-stamp the boundary walls *after* the interior fill so
+        # the disc-sweep cannot erase outward-facing wall pixels at the
+        # apex of tight turns where local half-width exceeds the offset
+        # distance to the wall vertices.
+        draw.line(left_px + [left_px[0]], fill=0, width=wall_width)
+        for px, py in left_px:
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=0)
+        draw.line(right_px + [right_px[0]], fill=0, width=wall_width)
+        for px, py in right_px:
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=0)
 
         return img, origin, res
 
