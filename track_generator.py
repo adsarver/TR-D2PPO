@@ -123,13 +123,8 @@ class TrackGenerator:
         self.max_attempts = max_attempts
         self.rng = np.random.default_rng(seed)
 
-        # Boundary constraint: turn radius must exceed half track width
         if self.min_turn_radius < self.max_track_width / 2.0:
             self.min_turn_radius = self.max_track_width / 2.0 + 0.5
-
-    # ─────────────────────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────────────────────
 
     def generate(self, name: str | None = None) -> str:
         """
@@ -159,10 +154,6 @@ class TrackGenerator:
             f"Failed to generate a valid track after {self.max_attempts} attempts. "
             f"Try relaxing constraints (larger min_turn_radius, smaller max_track_width, etc.)."
         )
-
-    # ─────────────────────────────────────────────────────────────
-    # Core pipeline
-    # ─────────────────────────────────────────────────────────────
 
     def _try_generate(self, name, map_dir):
         """Single attempt. Returns *name* on success, None on failure."""

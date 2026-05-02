@@ -20,33 +20,18 @@ import numpy as np
 
 from baselines.gap_follow_pure_pursuit import GapFollowPurePursuit
 from baselines.mpc_agent import MPCAgent
+from utils.sim_config import LIDAR_BEAMS, LIDAR_FOV, SIM_PARAMS
 from utils.utils import get_map_dir, generate_start_poses
 
-# ──────────────────────────────────────────────────────────────────────
-# Car physics (must match the simulator)
-# ──────────────────────────────────────────────────────────────────────
-PARAMS_DICT = {
-    'mu': 1.0489, 'C_Sf': 4.718, 'C_Sr': 5.4562,
-    'lf': 0.15875, 'lr': 0.17145, 'h': 0.074,
-    'm': 3.74, 'I': 0.04712,
-    's_min': -0.34, 's_max': 0.34,
-    'sv_min': -3.2, 'sv_max': 3.2,
-    'v_switch': 7.319, 'a_max': 9.51,
-    'v_min': -5.0, 'v_max': 20.0,
-    'width': 0.31, 'length': 0.58,
-}
-
+PARAMS_DICT = SIM_PARAMS.copy()
 WHEELBASE = PARAMS_DICT['lf'] + PARAMS_DICT['lr']
 MAX_STEERING = PARAMS_DICT['s_max']
-LIDAR_BEAMS = 1080
-LIDAR_FOV = 4.7
 NUM_AGENTS = 1
 
 MIN_LAPS = 3
 LAP_TIMEOUT = 70.0 * MIN_LAPS
 COLLISION_TIMEOUT = 0.5
 
-# Speed search range
 SPEED_MIN = 3.0
 SPEED_MAX = 20.0
 SPEED_STEP = 0.5
@@ -55,9 +40,6 @@ MAX_CONSECUTIVE_FAILS = 3
 
 NUM_WORKERS = 12
 
-# ──────────────────────────────────────────────────────────────────────
-# Best parameters from the grid search
-# ──────────────────────────────────────────────────────────────────────
 BEST_PARAMS = {
     "GapFollowPurePursuit": {
         'lookahead_distance': 1.4,
@@ -71,9 +53,6 @@ BEST_PARAMS = {
     },
 }
 
-# ──────────────────────────────────────────────────────────────────────
-# Map list
-# ──────────────────────────────────────────────────────────────────────
 ALL_MAPS = sorted([
     d for d in os.listdir("maps")
     if os.path.isdir(os.path.join("maps", d))
@@ -81,10 +60,6 @@ ALL_MAPS = sorted([
     and d != "BrandsHatchObs"
 ])
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Agent construction
-# ──────────────────────────────────────────────────────────────────────
 def make_agent(algo_name, map_name, max_speed, min_speed, extra):
     if algo_name == "GapFollowPurePursuit":
         return GapFollowPurePursuit(
@@ -112,9 +87,6 @@ def make_agent(algo_name, map_name, max_speed, min_speed, extra):
     raise ValueError(f"Unknown algorithm: {algo_name}")
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Core: run MIN_LAPS on one map
-# ──────────────────────────────────────────────────────────────────────
 def run_laps(env, agent, map_name, max_speed, num_laps=MIN_LAPS):
     env.update_map(get_map_dir(map_name) + f"/{map_name}_map", ".png")
 
@@ -159,9 +131,6 @@ def run_laps(env, agent, map_name, max_speed, num_laps=MIN_LAPS):
     return False, 0.0
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Worker pool
-# ──────────────────────────────────────────────────────────────────────
 _worker_env = None
 
 
@@ -192,9 +161,6 @@ def _evaluate(args):
     return (algo_name, map_name, max_speed, min_speed, ok, avg_lap)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────
 def main():
     os.makedirs("results", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -205,7 +171,6 @@ def main():
     speeds = np.arange(SPEED_MIN, SPEED_MAX + SPEED_STEP / 2, SPEED_STEP)
     speeds = [round(float(s), 1) for s in speeds]
 
-    # Build ALL work items: algo × map × speed
     work_items = []
     for algo_name, extra in BEST_PARAMS.items():
         for map_name in ALL_MAPS:
@@ -223,8 +188,6 @@ def main():
     pool = mp.Pool(processes=n_workers, initializer=_worker_init,
                    initargs=(work_dir,))
 
-    # Collect results
-    # results_by[algo][map] = [(speed, ok, avg_lap), ...]
     results_by = {algo: {m: [] for m in ALL_MAPS} for algo in BEST_PARAMS}
 
     t0 = time.time()
@@ -244,7 +207,6 @@ def main():
     elapsed = time.time() - t0
     print(f"\n  All evaluations complete in {elapsed:.1f}s\n")
 
-    # ── Analyse: per map, find the max speed where all laps completed ──
     fields = [
         "algorithm", "map", "best_max_speed", "avg_lap_time_at_best",
         "all_speeds_tested", "pass_fail_summary",
@@ -282,14 +244,12 @@ def main():
             })
         print()
 
-    # Write CSV
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for row in rows:
             w.writerow(row)
 
-    # ── Compact summary table ──
     print(f"\n{'=' * 70}")
     print(f"  COMPACT SUMMARY — Best max_speed per algorithm × map")
     print(f"{'=' * 70}")

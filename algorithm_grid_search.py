@@ -27,26 +27,12 @@ from baselines.gap_follow_pure_pursuit import (
     GapFollowPurePursuit, GFPP_MAP_SPEED_LOOKUP,
 )
 from baselines.mpc_agent import MPCAgent, MPC_MAP_SPEED_LOOKUP
+from utils.sim_config import LIDAR_BEAMS, LIDAR_FOV, SIM_PARAMS
 from utils.utils import get_map_dir, generate_start_poses
 
-# ──────────────────────────────────────────────────────────────────────
-# Car physics (must match the simulator)
-# ──────────────────────────────────────────────────────────────────────
-PARAMS_DICT = {
-    'mu': 1.0489, 'C_Sf': 4.718, 'C_Sr': 5.4562,
-    'lf': 0.15875, 'lr': 0.17145, 'h': 0.074,
-    'm': 3.74, 'I': 0.04712,
-    's_min': -0.34, 's_max': 0.34,
-    'sv_min': -3.2, 'sv_max': 3.2,
-    'v_switch': 7.319, 'a_max': 9.51,
-    'v_min': -5.0, 'v_max': 20.0,
-    'width': 0.31, 'length': 0.58,
-}
-
+PARAMS_DICT = SIM_PARAMS.copy()
 WHEELBASE = PARAMS_DICT['lf'] + PARAMS_DICT['lr']
 MAX_STEERING = PARAMS_DICT['s_max']
-LIDAR_BEAMS = 1080
-LIDAR_FOV = 4.7
 NUM_AGENTS = 1  # single-agent evaluation
 
 # Minimum laps an agent must complete on every map
@@ -61,9 +47,6 @@ EARLY_STOP_MAP_FAILURES = 3
 # Multiprocessing: 0 = auto-detect.
 NUM_WORKERS = 12  # i9-14900K: 32 threads available
 
-# ──────────────────────────────────────────────────────────────────────
-# Map list – every directory under maps/ that has a raceline CSV
-# ──────────────────────────────────────────────────────────────────────
 ALL_MAPS = sorted([
     d for d in os.listdir("maps")
     if os.path.isdir(os.path.join("maps", d))
@@ -71,9 +54,6 @@ ALL_MAPS = sorted([
     and d != "BrandsHatchObs"  # obstacle variant, skip for baseline search
 ])
 
-# ──────────────────────────────────────────────────────────────────────
-# Per-map speed lookups (from map_speed_search.py)
-# ──────────────────────────────────────────────────────────────────────
 DEFAULT_SPEED = 5.0  # fallback for maps / algos without a lookup entry
 
 ALGO_SPEED_LOOKUPS = {
@@ -86,42 +66,30 @@ def get_map_speed(algo_name: str, map_name: str) -> float:
     """Return the known-safe max speed for (algo, map), or DEFAULT_SPEED."""
     return ALGO_SPEED_LOOKUPS.get(algo_name, {}).get(map_name, DEFAULT_SPEED)
 
-# ──────────────────────────────────────────────────────────────────────
-# Parameter grids (max_speed is NOT here – it is swept separately)
-# ──────────────────────────────────────────────────────────────────────
-# Paper starting values → PurePursuit(lookahead=1.5, min_speed=1.0)
+# max_speed is swept separately from these parameter grids.
 PP_GRID = {
     'lookahead_distance': [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
     'min_speed':          [0.5, 1.0, 1.5],
 }
 
-# Paper starting values → GapFollow(bubble_radius=8, max_gap_safe_dist=1.8,
-#   max_sight=8.0, min_speed=1.0, hysteresis=0.2)
 GF_GRID = {
     'bubble_radius':     [5, 8, 12],
     'max_gap_safe_dist': [1.2, 1.8, 2.5],
     'max_sight':         [5.0, 8.0, 10.0],
 }
 
-# Paper starting values → GFPP(lookahead=1.5, threshold_v_min=0.9,
-#   threshold_v_max=1.8)
 GFPP_GRID = {
     'lookahead_distance':  [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0],
     'threshold_at_v_min':  [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
     'threshold_at_v_max':  [1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.3, 2.5],
 }
 
-# Paper starting values → MPC(horizon=8, speed_scale=1.2, emergency_dist=1.2)
 MPC_GRID = {
     'horizon':        [6, 7, 8, 9, 10, 11, 12],
     'speed_scale':    [0.8, 0.9, 1.0, 1.1, 1.2],
     'emergency_dist': [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6],
 }
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────
 
 def grid_combos(grid: dict) -> list:
     """Return every combination of values from *grid* as a list of dicts."""
@@ -175,10 +143,6 @@ def make_agent(algo_name: str, map_name: str, max_speed: float, extra: dict):
     raise ValueError(f"Unknown algorithm: {algo_name}")
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Core: run MIN_LAPS laps on one map
-# ──────────────────────────────────────────────────────────────────────
-
 def run_laps(env, agent, map_name, max_speed, num_laps=MIN_LAPS):
     """
     Run *num_laps* consecutive laps with *agent* on *map_name*.
@@ -190,10 +154,8 @@ def run_laps(env, agent, map_name, max_speed, num_laps=MIN_LAPS):
     avg_lap_time : float
         Mean simulated seconds per lap (meaningful only when completed).
     """
-    # Switch the environment to the target map
     env.update_map(get_map_dir(map_name) + f"/{map_name}_map", ".png")
 
-    # Find a collision-free starting pose (retry with small offsets)
     obs = None
     for attempt in range(20):
         poses = generate_start_poses(map_name, NUM_AGENTS,
@@ -241,18 +203,12 @@ def run_laps(env, agent, map_name, max_speed, num_laps=MIN_LAPS):
     return False, 0.0  # timed-out or crashed before completing all laps
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Worker: evaluate one (algo, params, speed, map) in a subprocess
-# ──────────────────────────────────────────────────────────────────────
-
-# Per-process cached environment (avoid re-creating for every map).
 _worker_env = None
 
 
 def _worker_init(work_dir):
     """Each pool worker creates its own gym environment eagerly."""
     global _worker_env
-    # Spawned children may have a different cwd; restore it.
     os.chdir(work_dir)
     first_map = ALL_MAPS[0]
     _worker_env = gym.make(
@@ -263,7 +219,6 @@ def _worker_init(work_dir):
         fov=LIDAR_FOV,
         params=PARAMS_DICT,
     )
-    # reset + render so internal renderer state is populated before update_map
     poses = generate_start_poses(first_map, NUM_AGENTS, race=True)
     _worker_env.reset(poses=poses)
     _worker_env.render(mode="human")
@@ -282,10 +237,6 @@ def _evaluate_single_map(args):
     ok, avg_lap = run_laps(env, agent, map_name, max_speed)
     return (combo_key, map_name, ok, avg_lap)
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Main grid-search loop
-# ──────────────────────────────────────────────────────────────────────
 
 def _aggregate_combo_results(results_list, maps):
     """
@@ -306,10 +257,6 @@ def _aggregate_combo_results(results_list, maps):
     return all_ok, completion_rate, avg_time, per_map
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────
-
 def main():
     os.makedirs("results", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -317,7 +264,6 @@ def main():
     detail_csv  = os.path.join("results", f"grid_search_detail_{timestamp}.csv")
     summary_csv = os.path.join("results", f"grid_search_summary_{timestamp}.csv")
 
-    # Determine worker count
     n_workers = NUM_WORKERS if NUM_WORKERS > 0 else min(os.cpu_count() / 2 or 1, 8)
     print(f"Launching pool with {n_workers} worker(s)  "
           f"({len(ALL_MAPS)} maps, {MIN_LAPS} laps per map)")
@@ -331,7 +277,6 @@ def main():
         "MPCAgent":             MPC_GRID,
     }
 
-    # ── Build every (algo, params) combo ──
     all_combos = {}   # combo_key → (algo_name, extra_params)
     for algo_name, grid in algorithms.items():
         for ci, extra in enumerate(grid_combos(grid)):

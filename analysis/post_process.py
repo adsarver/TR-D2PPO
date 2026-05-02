@@ -1,89 +1,37 @@
-# -*- coding: utf-8 -*-
-import pickle
-import json
+import os
 import numpy as np
 
-# ── Maps to include in the combined (aggregate) lap-stats figure ──
-COMBINED_MAPS = ['Nuerburgring', 'Sepang', 'IMS']
-EXPECTED_LAPS = 3  # number of laps each race is run for
-
-race_data = dict()
-lstm = dict()
-mpc = dict()
-
-with open('analysis/race_data_race2.pkl', 'rb') as f:
-    race_data = pickle.load(f)
-# with open('analysis/race_data_paper1.pkl', 'rb') as f:
-#     lstm = pickle.load(f)
-# with open('analysis/race_data_gf_8.0ms.pkl', 'rb') as f:
-#     gf = pickle.load(f)
-# with open('analysis/race_data_MPC_variable_speed3.pkl', 'rb') as f:
-#     mpc = pickle.load(f)
-
-# Backwards compatibility: legacy pkls keyed agents by class name
-# (``SupervisedAgent``); the current paper_data_collection script keys
-# by explicit labels (``BC_LSTM``, ``D2PPO``).  Map either format to
-# human-friendly display names without breaking older data files.
-_LEGACY_RENAMES = {
-    "SupervisedAgent": "TR Agent",  # very old runs
-    "BC_LSTM":         "BC-LSTM",   # supervised baseline
-    "D2PPO":           "D²PPO",     # RL-trained actor
-}
-for _src, _dst in _LEGACY_RENAMES.items():
-    if _src in race_data and _dst not in race_data:
-        race_data[_dst] = race_data.pop(_src)
-# race_data['MPCAgent'] = mpc['MPCAgent_12.0']
-# race_data['GapFollow'] = gf['GapFollow']
-# del race_data['SupervisedAgent']
-# # del race_data['PurePursuit']
-
-# race_data['Ours']['Catalunya'] = [
-#     lap for lap in race_data['Ours']['Catalunya']
-#     if lap['lap_counts'][0] < 3
-# ]
+try:
+    from analysis.result_utils import (
+        format_lap_time,
+        load_centerline,
+        load_race_data,
+        new_lap_record,
+        project_progress,
+        safe_name,
+        style_table,
+    )
+except ImportError:
+    from result_utils import (
+        format_lap_time,
+        load_centerline,
+        load_race_data,
+        new_lap_record,
+        project_progress,
+        safe_name,
+        style_table,
+    )
 
 
-def _load_centerline(map_name):
-    """Load centerline and return (xy array, cumulative arc-length array, total lap length)."""
-    import glob
-    # Try exact name first, then fall back to any *_centerline.csv in the dir
-    candidates = [
-        f'maps/{map_name}/{map_name}_centerline.csv',
-    ]
-    found = glob.glob(f'maps/{map_name}/*_centerline.csv')
-    candidates.extend(found)
-    cl = None
-    for path in candidates:
-        try:
-            cl = np.genfromtxt(path, delimiter=',', comments='#')
-            break
-        except Exception:
-            continue
-    if cl is None:
-        raise FileNotFoundError(f'No centerline found for {map_name}')
-    xy = cl[:, :2]
-    diffs = np.diff(xy, axis=0)
-    seg_lens = np.sqrt((diffs**2).sum(axis=1))
-    cum_s = np.concatenate([[0.0], np.cumsum(seg_lens)])
-    # Close the loop
-    lap_length = cum_s[-1] + np.linalg.norm(xy[-1] - xy[0])
-    return xy, cum_s, lap_length
+RACE_DATA_PATH = 'analysis/analysis/race_data_CS677.pkl'
+OVERTAKE_DATA_PATH = 'analysis/race_data_OVERTAKE.pkl'
+COMBINED_MAPS = os.listdir("maps")
+EXPECTED_LAPS = 3
 
 
-def _project_progress(pos, cl_xy, cl_cum_s, lap_length):
-    """Return normalised progress in [0,1] for a world position along the centerline."""
-    dists = np.sqrt(((cl_xy - pos)**2).sum(axis=1))
-    idx = int(np.argmin(dists))
-    return float(cl_cum_s[idx] / lap_length)
-
-
-def create_lap_comparison():
-    # Structure per lap: Positions, Velocity, Time, Max Speed,
-    #                    Collisions (int count), Progress (float 0-1, only for DNF)
-    # NOTE: lap_counts in the pickle is unreliable (numpy aliasing from env reuse).
-    #       We detect laps by watching for lap_time resets (drop > 0.5 s).
+def create_lap_comparison(race_data):
     lap_comparison = dict()
-    centerlines = {}  # cache
+    centerlines = {}
 
     for agent, maps in race_data.items():
         for map_name, obss in maps.items():
@@ -93,14 +41,12 @@ def create_lap_comparison():
             # Load centerline for progress computation
             if map_name not in centerlines:
                 try:
-                    centerlines[map_name] = _load_centerline(map_name)
+                    centerlines[map_name] = load_centerline(map_name)
                 except Exception:
                     centerlines[map_name] = None
 
             laps = []
-            current_lap = {'Positions': [], 'Velocity': [], 'Time': None,
-                           'Collisions': 0, 'WallCollisions': 0, 'AgentCollisions': 0,
-                           'WallColSteps': 0, 'AgentColSteps': 0}
+            current_lap = new_lap_record()
             col_exit = False
             prev_lap_time = 0.0
             prev_collision = 0
@@ -115,8 +61,6 @@ def create_lap_comparison():
 
                 lt = obs.get('lap_time', None)
 
-                # Count collision onsets and total collision steps
-                # collisions flag: 0 = none, 1 = wall, 2 = agent-agent
                 cur_col = int(obs.get('collisions', [0])[0])
                 in_collision = cur_col >= 1
                 was_in_collision = prev_collision >= 1
@@ -132,15 +76,11 @@ def create_lap_comparison():
                         current_lap['AgentCollisions'] += 1
                 prev_collision = cur_col
 
-                # Detect a lap completion: lap_time resets (drops significantly)
                 if lt is not None and prev_lap_time > 0.5 and lt < prev_lap_time - 0.5:
                     current_lap['Time'] = float(prev_lap_time)
                     laps.append(current_lap)
-                    current_lap = {'Positions': [], 'Velocity': [], 'Time': None,
-                                   'Collisions': 0, 'WallCollisions': 0, 'AgentCollisions': 0,
-                                   'WallColSteps': 0, 'AgentColSteps': 0}
+                    current_lap = new_lap_record()
 
-                # Append data to current lap
                 current_lap['Positions'].append((obs['poses_x'][0], obs['poses_y'][0]))
                 current_lap['Velocity'].append(obs['linear_vels_x'][0])
 
@@ -150,62 +90,46 @@ def create_lap_comparison():
             # Append last in-progress lap if it has data and wasn't already added
             if current_lap['Positions'] and (not laps or laps[-1] is not current_lap):
                 if col_exit:
-                    # Already marked 'DNF' above
                     laps.append(current_lap)
                 elif prev_lap_time > 0.5:
-                    # Sim ended normally (no collision).  The data-collection
-                    # loop exits right after the final lap completes, so the
-                    # trailing data IS the completed last lap.
                     current_lap['Time'] = float(prev_lap_time)
                     laps.append(current_lap)
                 else:
-                    # Trailing lap with virtually no time – truly incomplete
                     current_lap['Time'] = 'DNF'
                     current_lap['DNF_reason'] = 'incomplete'
                     laps.append(current_lap)
 
-            # Compute per-lap metrics
-            SIM_DT = 0.01  # f110_gym timestep
+            SIM_DT = 0.01
             for lap in laps:
                 lap['Max Speed'] = float(np.max(lap['Velocity'])) if lap['Velocity'] else 0.0
-                
-                # Collision Severity Score (CSS)
-                # Wall collisions (stuck/DNF-causing) weighted 3× more than
-                # agent-agent bumps (typically brief and recoverable).
-                # DNF laps get a flat penalty of 1.0 so that crashing out
-                # always scores worse than completing a lap with bumps.
-                # CSS = 0.5 * (weighted_event_rate + weighted_time_fraction) [+ DNF penalty]
+
                 W_WALL  = 3.0
                 W_AGENT = 1.0
                 DNF_PENALTY = 1.0
-                
+
                 n_steps = len(lap['Positions'])
                 lap_duration = n_steps * SIM_DT if n_steps > 0 else 1.0
-                
+
                 wall_events = lap.get('WallCollisions', 0)
                 agent_events = lap.get('AgentCollisions', 0)
                 wall_steps = lap.get('WallColSteps', 0)
                 agent_steps = lap.get('AgentColSteps', 0)
-                
+
                 weighted_events = W_WALL * wall_events + W_AGENT * agent_events
                 weighted_col_time = (W_WALL * wall_steps + W_AGENT * agent_steps) * SIM_DT
-                
+
                 event_rate = weighted_events / lap_duration
                 time_frac  = weighted_col_time / lap_duration
                 base_css = 0.5 * (event_rate + time_frac)
-                
-                # DNF penalty: only for collision-caused DNFs, not sim-ended incomplete laps
+
                 is_collision_dnf = (lap['Time'] == 'DNF' and lap.get('DNF_reason') == 'collision')
                 lap['CSS'] = base_css + (DNF_PENALTY if is_collision_dnf else 0.0)
-                
-                # Progress before failure (for DNF laps)
+
                 if lap['Time'] == 'DNF' and lap['Positions'] and centerlines.get(map_name) is not None:
                     cl_xy, cl_cum_s, lap_length = centerlines[map_name]
-                    # Use maximum progress seen during the lap (handles wrap-around
-                    # near start/finish where final position could look like ~0)
                     positions = np.array(lap['Positions'])
                     prog_all = np.array([
-                        _project_progress(positions[k], cl_xy, cl_cum_s, lap_length)
+                        project_progress(positions[k], cl_xy, cl_cum_s, lap_length)
                         for k in range(len(positions))
                     ])
                     lap['Progress'] = float(np.max(prog_all))
@@ -218,20 +142,6 @@ def create_lap_comparison():
             }
 
     return lap_comparison
-
-lap_comparison = create_lap_comparison()
-def pretty_print_dict(d):
-    print(json.dumps(d, indent=4))
-
-def world_to_pixel(x, y, origin, resolution, img_height):
-    """Convert world coordinates (meters) to image pixel coordinates.
-    
-    The map YAML origin is the world position of the bottom-left corner of the image.
-    Image y increases downward, world y increases upward, so we flip the y axis.
-    """
-    px = (x - origin[0]) / resolution
-    py = img_height - (y - origin[1]) / resolution
-    return px, py
 
 def plot_raceline_on_map_image(d):
     import matplotlib.pyplot as plt
@@ -260,7 +170,6 @@ def plot_raceline_on_map_image(d):
         cmap = plt.cm.plasma
         norm = plt.Normalize(V_MIN, V_MAX)
 
-        # ── One figure per agent ──
         for agent_name, data in agents.items():
             laps = data['laps']
             if not laps:
@@ -340,7 +249,7 @@ def plot_raceline_on_map_image(d):
             cbar.set_label("Speed (m/s)", fontsize=16)
 
             ax.axis('off')
-            safe_agent = agent_name.replace(' ', '_')
+            safe_agent = safe_name(agent_name)
             ax.set_title(f"{agent_name} — {map_name}  ({len(laps)} laps)",
                          fontsize=18, fontweight='bold')
             cbar.ax.tick_params(labelsize=12)
@@ -366,7 +275,6 @@ def plot_velocity_profiles(d):
             if agent_name not in agent_colors:
                 agent_colors[agent_name] = color_cycle[i % len(color_cycle)]
 
-        # ── Per-agent velocity profile figures ──
         for agent_name, data in agents.items():
             n_laps = len(data['laps'])
             if n_laps == 0:
@@ -421,7 +329,7 @@ def plot_velocity_profiles(d):
             for i in range(n_laps + 1, len(axes)):
                 axes[i].set_visible(False)
 
-            safe_agent = agent_name.replace(' ', '_')
+            safe_agent = safe_name(agent_name)
             fig.suptitle(f"Velocity Profile — {agent_name} — {map_name}", fontsize=14, fontweight='bold')
             fig.tight_layout()
             fig.savefig(f"{map_dir}/velocity_profile_{safe_agent}.png", dpi=300)
@@ -435,25 +343,12 @@ def plot_lap_stats_table(d):
 
     TARGET_LAPS = 10  # K for CR@K
 
-    def style_table(table, n_cols, n_rows):
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        table.auto_set_column_width(list(range(n_cols)))
-        for col in range(n_cols):
-            table[0, col].set_facecolor('#2c3e50')
-            table[0, col].set_text_props(color='white', fontweight='bold')
-        for row in range(1, n_rows + 1):
-            color = '#ecf0f1' if row % 2 == 0 else 'white'
-            for col in range(n_cols):
-                table[row, col].set_facecolor(color)
-
     for map_name, agents in d.items():
         map_dir = f"analysis/map_results/{map_name}"
         os.makedirs(map_dir, exist_ok=True)
 
         agent_names = sorted(agents.keys())
 
-        # ── Per-Lap Table (all laps, including DNF) ──
         per_lap_cols = ['Agent', 'Lap', 'Lap Time (s)', 'Max Speed (m/s)',
                         'Collisions', 'CSS', '% Completed', 'Progress @ Fail']
         per_lap_rows = []
@@ -462,10 +357,7 @@ def plot_lap_stats_table(d):
             laps = data['laps']
             for i, lap in enumerate(laps):
                 t = lap['Time']
-                try:
-                    t_str = f"{float(t):.3f}"
-                except (TypeError, ValueError):
-                    t_str = 'DNF' if t == 'DNF' else ('—' if t is None else str(t))
+                t_str = format_lap_time(t)
                 is_dnf = (t == 'DNF')
                 spd = f"{lap['Max Speed']:.3f}"
                 cols_str = str(lap.get('Collisions', 0))
@@ -484,7 +376,6 @@ def plot_lap_stats_table(d):
                     prog_at_fail,
                 ])
 
-        # ── Summary Table (all agents, all laps included) ──
         n_all_laps = max(len(agents[a]['laps']) for a in agent_names) if agent_names else 0
         cr_k = n_all_laps if n_all_laps > 0 else TARGET_LAPS
         summary_cols = ['Agent', f'CR@{cr_k}', 'Lap Time (s)',
@@ -544,7 +435,6 @@ def plot_lap_stats_table(d):
             summary_rows.append([agent_name, cr_at_k, time_str,
                                  max_speed, col_rate, css_str, pct_str, prog_str])
 
-        # ── Draw both tables ──
         n_per_lap = len(per_lap_rows)
         n_summary = len(summary_rows)
         if n_per_lap == 0:
@@ -575,10 +465,6 @@ def plot_lap_stats_table(d):
         fig.savefig(f"{map_dir}/lap_stats.png", dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-# ── Run tables first (fast), then plots (slow) ──
-plot_lap_stats_table(lap_comparison)
-
-
 def plot_combined_lap_stats(d, map_list):
     """Produce a single combined lap-stats figure that aggregates laps across
     all maps in *map_list*.  Per-lap rows show (Map, Lap, …) and the summary
@@ -588,33 +474,17 @@ def plot_combined_lap_stats(d, map_list):
 
     TARGET_LAPS = 10
 
-    def style_table(table, n_cols, n_rows):
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        table.auto_set_column_width(list(range(n_cols)))
-        for col in range(n_cols):
-            table[0, col].set_facecolor('#2c3e50')
-            table[0, col].set_text_props(color='white', fontweight='bold')
-        for row in range(1, n_rows + 1):
-            color = '#ecf0f1' if row % 2 == 0 else 'white'
-            for col in range(n_cols):
-                table[row, col].set_facecolor(color)
-
-    # Filter to only maps present in both the requested list and the data
     active_maps = [m for m in map_list if m in d]
     if not active_maps:
         print("  [combined] No matching maps found – skipping.")
         return
 
-    # Collect the union of agent names across all selected maps
     all_agents = sorted({a for m in active_maps for a in d[m]})
 
-    # ── Per-Lap Table ──
     per_lap_cols = ['Agent', 'Map', 'Lap', 'Lap Time (s)', 'Max Speed (m/s)',
                     'Collisions', 'CSS', '% Completed', 'Progress @ Fail']
     per_lap_rows = []
-    # Also collect laps per agent for the summary
-    agent_laps = {a: [] for a in all_agents}  # agent -> [lap_dict, …]
+    agent_laps = {a: [] for a in all_agents}
 
     for map_name in active_maps:
         agents = d[map_name]
@@ -626,10 +496,7 @@ def plot_combined_lap_stats(d, map_list):
             for i, lap in enumerate(laps):
                 agent_laps[agent_name].append(lap)
                 t = lap['Time']
-                try:
-                    t_str = f"{float(t):.3f}"
-                except (TypeError, ValueError):
-                    t_str = 'DNF' if t == 'DNF' else ('—' if t is None else str(t))
+                t_str = format_lap_time(t)
                 is_dnf = (t == 'DNF')
                 spd = f"{lap['Max Speed']:.3f}"
                 cols_str = str(lap.get('Collisions', 0))
@@ -649,7 +516,6 @@ def plot_combined_lap_stats(d, map_list):
                     prog_at_fail,
                 ])
 
-    # ── Summary Table ──
     total_lap_counts = [len(agent_laps[a]) for a in all_agents]
     n_all_laps = max(total_lap_counts) if total_lap_counts else 0
     cr_k = n_all_laps if n_all_laps > 0 else TARGET_LAPS
@@ -733,7 +599,6 @@ def plot_combined_lap_stats(d, map_list):
                              cr_at_k, time_str, max_speed, col_rate,
                              css_str, pct_str, prog_str])
 
-    # ── Draw ──
     n_per_lap = len(per_lap_rows)
     n_summary = len(summary_rows)
     if n_per_lap == 0:
@@ -767,9 +632,6 @@ def plot_combined_lap_stats(d, map_list):
     fig.savefig(f"{out_dir}/combined_lap_stats.png", dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved {out_dir}/combined_lap_stats.png")
-
-
-plot_combined_lap_stats(lap_comparison, COMBINED_MAPS)
 
 
 def plot_collision_free_survival(d):
@@ -811,8 +673,6 @@ def plot_collision_free_survival(d):
 
     for idx, (agent_name, trials) in enumerate(sorted(agent_trials.items())):
         n_trials = len(trials)
-        # For each lap k (0-indexed), compute fraction of trials that are
-        # still collision-free through lap k.
         survival = []
         for k in range(max_laps):
             still_alive = 0
@@ -821,8 +681,7 @@ def plot_collision_free_survival(d):
                     # Collision-free through lap k means all laps 0..k are True
                     if all(trial[:k + 1]):
                         still_alive += 1
-                # If trial has fewer laps than k, it either DNF'd or ended;
-                # count it as NOT surviving past its last lap.
+                # Short trials do not survive beyond their last lap.
             survival.append(still_alive / n_trials)
 
         laps_x = np.arange(1, max_laps + 1)
@@ -844,9 +703,6 @@ def plot_collision_free_survival(d):
     fig.savefig("analysis/map_results/collision_free_survival.png",
                 dpi=300, bbox_inches='tight')
     plt.close(fig)
-
-plot_collision_free_survival(lap_comparison)
-
 
 def plot_lap_time_distribution(d):
     """Per-map boxplot of lap-time distributions across agents.
@@ -943,46 +799,20 @@ def plot_lap_time_distribution(d):
         print(f"  Saved {map_dir}/lap_time_distribution.png")
 
 
-plot_lap_time_distribution(lap_comparison)
-
-# Now run the slower plot functions
-plot_raceline_on_map_image(lap_comparison)
-plot_velocity_profiles(lap_comparison)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Multi-agent interaction metrics (overtake data)
-# ──────────────────────────────────────────────────────────────────────
-
-overtake_data = dict()
-try:
-    with open('analysis/race_data_OVERTAKE.pkl', 'rb') as f:
-        overtake_data = pickle.load(f)
-    # Rename SupervisedAgent → Ours and drop PurePursuit to match race_data
-    if 'SupervisedAgent' in overtake_data:
-        overtake_data['TR Agent'] = overtake_data.pop('SupervisedAgent')
-    overtake_data.pop('PurePursuit', None)
-except FileNotFoundError:
-    pass
+def load_overtake_data():
+    try:
+        data = load_race_data(
+            OVERTAKE_DATA_PATH,
+            agent_renames={'SupervisedAgent': 'TR Agent'},
+        )
+    except FileNotFoundError:
+        return {}
+    data.pop('PurePursuit', None)
+    return data
 
 
 def plot_interaction_metrics(data):
-    """
-    Produce a per-map interaction-metrics table (saved as PNG) with columns:
-        Method | OSR (%) | Coll./min | d_min (m)
-
-    Metrics
-    -------
-    OSR  – Overtake Success Rate.  For each opponent, we track the signed
-           progress gap (ego − opp) on the centerline with wrap-around.
-           An *overtake*  = gap crosses from ≤0 to >+thresh.
-           A  *got-passed*= gap crosses from >0  to ≤−thresh.
-           OSR = overtakes / max(overtakes + got_passed, 1) × 100.
-
-    Coll./min – number of ego collision onsets per minute of sim time.
-
-    d_min – global minimum Euclidean distance between ego and any opponent.
-    """
+    """Save per-map and aggregate overtaking interaction tables."""
     if not data:
         return
     import matplotlib.pyplot as plt
@@ -996,11 +826,10 @@ def plot_interaction_metrics(data):
     for map_name in {m for maps in data.values() for m in maps}:
         if map_name not in centerlines:
             try:
-                centerlines[map_name] = _load_centerline(map_name)
+                centerlines[map_name] = load_centerline(map_name)
             except Exception:
                 centerlines[map_name] = None
 
-    # Collect results:  { map_name: { agent: {osr, coll_min, d_min} } }
     results = {}
 
     def _vectorised_progress(positions_xy, cl_xy, cl_cum_s, lap_length):
@@ -1025,18 +854,15 @@ def plot_interaction_metrics(data):
             n_obs = len(obss)
             sim_time_min = n_obs * DT / 60.0
 
-            # Build position arrays once: (n_obs, n_cars)
             all_px = np.array([o['poses_x'] for o in obss])  # (n_obs, n_cars)
             all_py = np.array([o['poses_y'] for o in obss])
             all_col = np.array([o['collisions'] for o in obss])  # (n_obs, n_cars)
 
-            # --- Collision onsets (0 → any nonzero = rising edge) ---
             ego_in_col = (all_col[:, ego] != 0).astype(int)
             onsets = np.diff(ego_in_col)
             col_onsets = int(np.sum(onsets == 1))
             coll_min = col_onsets / sim_time_min if sim_time_min > 0 else 0.0
 
-            # --- d_min (vectorised) ---
             ego_xy = np.stack([all_px[:, ego], all_py[:, ego]], axis=1)  # (n_obs, 2)
             d_min = float('inf')
             for j in range(n_cars):
@@ -1046,7 +872,6 @@ def plot_interaction_metrics(data):
                 dists = np.sqrt(((ego_xy - opp_xy)**2).sum(axis=1))
                 d_min = min(d_min, float(dists.min()))
 
-            # --- OSR using cumulative progress (lap_count + fractional) ---
             osr = 0.0
             cl_info = centerlines.get(map_name)
             has_lap_counts = 'lap_counts' in obss[0]
@@ -1056,7 +881,6 @@ def plot_interaction_metrics(data):
                 ego_sub_xy = ego_xy[sub_idx]
                 ego_frac = _vectorised_progress(ego_sub_xy, cl_xy, cl_cum_s, lap_length)
 
-                # Build cumulative progress: lap_count + fractional position
                 if has_lap_counts:
                     all_laps = np.array([o['lap_counts'] for o in obss])  # (n_obs, n_cars)
                     ego_cum = all_laps[sub_idx, ego].astype(float) + ego_frac
@@ -1129,7 +953,6 @@ def plot_interaction_metrics(data):
             print(f"  {agent}/{map_name}: OSR={osr:.1f}%, "
                   f"Coll/min={coll_min:.2f}, d_min={d_min:.2f}m")
 
-    # --- Render table per map ---
     for map_name, agents in results.items():
         col_labels = ['Method', 'OSR (%)', 'Coll./min', r'$d_{\min}$ (m)']
         rows = []
@@ -1153,21 +976,15 @@ def plot_interaction_metrics(data):
             cellText=rows, colLabels=col_labels,
             loc='center', cellLoc='center',
         )
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1.0, 1.5)
-
-        # Style header row
-        for j in range(len(col_labels)):
-            cell = table[0, j]
-            cell.set_facecolor('#4472C4')
-            cell.set_text_props(color='white', fontweight='bold')
-
-        # Alternate row shading
-        for i in range(1, n_rows + 1):
-            for j in range(len(col_labels)):
-                cell = table[i, j]
-                cell.set_facecolor('#D9E2F3' if i % 2 == 0 else 'white')
+        style_table(
+            table,
+            len(col_labels),
+            n_rows,
+            font_size=10,
+            header_color='#4472C4',
+            stripe_color='#D9E2F3',
+            scale=(1.0, 1.5),
+        )
 
         out_dir = f"analysis/map_results/{map_name}"
         os.makedirs(out_dir, exist_ok=True)
@@ -1177,7 +994,6 @@ def plot_interaction_metrics(data):
         plt.close(fig)
         print(f"  Saved {out_dir}/interaction_stats.png")
 
-    # --- Combined summary table across all maps ---
     if results:
         all_agents = sorted({a for agents in results.values() for a in agents})
         col_labels = ['Method', 'OSR (%)', 'Coll./min', r'$d_{\min}$ (m)']
@@ -1207,17 +1023,15 @@ def plot_interaction_metrics(data):
             cellText=rows, colLabels=col_labels,
             loc='center', cellLoc='center',
         )
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1.0, 1.5)
-        for j in range(len(col_labels)):
-            cell = table[0, j]
-            cell.set_facecolor('#4472C4')
-            cell.set_text_props(color='white', fontweight='bold')
-        for i in range(1, n_rows + 1):
-            for j in range(len(col_labels)):
-                cell = table[i, j]
-                cell.set_facecolor('#D9E2F3' if i % 2 == 0 else 'white')
+        style_table(
+            table,
+            len(col_labels),
+            n_rows,
+            font_size=10,
+            header_color='#4472C4',
+            stripe_color='#D9E2F3',
+            scale=(1.0, 1.5),
+        )
 
         os.makedirs("analysis/map_results", exist_ok=True)
         fig.tight_layout()
@@ -1225,10 +1039,6 @@ def plot_interaction_metrics(data):
                     dpi=300, bbox_inches='tight')
         plt.close(fig)
         print("  Saved analysis/map_results/interaction_stats_summary.png")
-
-
-plot_interaction_metrics(overtake_data)
-
 
 def plot_overtake_time_series(data):
     """
@@ -1254,7 +1064,6 @@ def plot_overtake_time_series(data):
             n_obs = len(obss)
             n_opp = n_cars - 1
 
-            # Build arrays
             all_px = np.array([o['poses_x'] for o in obss])
             all_py = np.array([o['poses_y'] for o in obss])
             ego_vx = np.array([o['linear_vels_x'][ego] for o in obss])
@@ -1272,7 +1081,6 @@ def plot_overtake_time_series(data):
 
             time_s = np.arange(n_obs) * DT
 
-            # ── Figure ──
             fig, ax1 = plt.subplots(figsize=(10, 4))
             ax2 = ax1.twinx()
 
@@ -1322,11 +1130,28 @@ def plot_overtake_time_series(data):
 
             out_dir = f'analysis/map_results/{map_name}'
             os.makedirs(out_dir, exist_ok=True)
-            safe = agent.replace(' ', '_')
+            safe = safe_name(agent)
             fig.savefig(f'{out_dir}/overtake_timeseries_{safe}.png',
                         dpi=300, bbox_inches='tight')
             plt.close(fig)
             print(f'  Saved {out_dir}/overtake_timeseries_{safe}.png')
 
 
-plot_overtake_time_series(overtake_data)
+def main():
+    race_data = load_race_data(RACE_DATA_PATH)
+    lap_comparison = create_lap_comparison(race_data)
+
+    plot_lap_stats_table(lap_comparison)
+    plot_combined_lap_stats(lap_comparison, COMBINED_MAPS)
+    plot_collision_free_survival(lap_comparison)
+    plot_lap_time_distribution(lap_comparison)
+    plot_raceline_on_map_image(lap_comparison)
+    plot_velocity_profiles(lap_comparison)
+
+    overtake_data = load_overtake_data()
+    plot_interaction_metrics(overtake_data)
+    plot_overtake_time_series(overtake_data)
+
+
+if __name__ == "__main__":
+    main()

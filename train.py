@@ -1,5 +1,4 @@
 import os
-# os.environ["DISPLAY"] = ":20"
 
 import gc
 import time
@@ -8,6 +7,7 @@ import numpy as np
 from D2PPO_agent import D2PPOAgent as PPOAgent
 from baselines.pure_pursuit import PurePursuit
 from utils.utils import *
+from utils.sim_config import LIDAR_BEAMS, LIDAR_FOV, SIM_PARAMS
 from track_generator import TrackGenerator
 import torch
 torch.backends.cudnn.benchmark = True
@@ -32,27 +32,8 @@ def _env_str(name, default):
     return value if value not in (None, "") else default
 
 
-params_dict = {'mu': 1.0489,
-               'C_Sf': 4.718,
-               'C_Sr': 5.4562,
-               'lf': 0.15875,
-               'lr': 0.17145,
-               'h': 0.074,
-               'm': 3.74,
-               'I': 0.04712,
-               's_min': -0.34,
-               's_max': 0.34,
-               'sv_min': -3.2,
-               'sv_max': 3.2,
-               'v_switch':7.319,
-               'a_max': 9.51,
-               'v_min': -5.0,
-               'v_max': 20.0,
-               'width': 0.31,
-               'length': 0.58
-               }
+params_dict = SIM_PARAMS.copy()
 
-# --- Main Training Parameters ---
 NUM_AGENTS_AI = 3
 NUM_AGENTS_PP = 8
 NUM_AGENTS = NUM_AGENTS_AI + NUM_AGENTS_PP
@@ -60,23 +41,15 @@ EASY_MAPS = ["Hockenheim", "Monza", "Melbourne", "BrandsHatch"]
 MEDIUM_MAPS = ["Sakhir", "SaoPaulo", "Budapest", "Silverstone"]
 HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Sochi",]
 TOTAL_TIMESTEPS = _env_int("TR_TOTAL_TIMESTEPS", 12_000_000)
-STEPS_PER_GENERATION = 2048  # Initial default; overwritten per-map to 10x track length
-LIDAR_BEAMS = 1080  # Default is 1080
-LIDAR_FOV = 4.7   # Default is 4.7 radians (approx 270 deg)
-INITIAL_POSES = None # Generated later
-CURRENT_MAP = _env_str("TR_START_MAP", "Zandvoort") # Starting map, used for pretraining
+STEPS_PER_GENERATION = 2048
+INITIAL_POSES = None
+CURRENT_MAP = _env_str("TR_START_MAP", "Zandvoort")
 PATIENCE = _env_int("TR_PATIENCE", 200)  # Early stopping patience
-GEN_PER_MAP = _env_int("TR_GEN_PER_MAP", 16)  # Bumped from 12 to compensate for longer critic warmup (4 gens)
+GEN_PER_MAP = _env_int("TR_GEN_PER_MAP", 16)
 MAX_GENERATIONS = _env_int("TR_MAX_GENERATIONS", 0)
 SKIP_RESUME = os.getenv("TR_SKIP_RESUME", "0") == "1"
 DISABLE_HELDOUT_EVAL = os.getenv("TR_DISABLE_HELDOUT_EVAL", "0") == "1"
-# Reset Adam optimizer state on curriculum map switches.  Discards momentum/
-# variance running averages that were estimated against the previous map's
-# loss surface, so they don't poison updates after the focus map changes.
-# Set to 0 to disable for ablation/comparison runs.
 RESET_OPT_ON_MAP_SWITCH = os.getenv("TR_RESET_OPT_ON_MAP_SWITCH", "1") == "1"
-# Held-out generalization eval: maps NEVER included in curriculum; used to score
-# "generalist" checkpoints periodically. Keep small (each eval costs ~1 gen).
 HELDOUT_MAPS = ["Spa", "YasMarina", "Spielberg"]
 HELDOUT_EVAL_EVERY = _env_int("TR_HELDOUT_EVAL_EVERY", 12)  # Generations between held-out evaluations
 MIN_SELECTION_SPEED = _env_float("TR_MIN_SELECTION_SPEED", 4.5)
@@ -179,9 +152,8 @@ track_gen = TrackGenerator(
     min_turn_radius=5.0,
     seed=None,  # Random every time
 )
-_last_generated_track = None  # Track cleanup bookkeeping
+_last_generated_track = None
 
-# -- Environment Setup ---
 env = gym.make(
     "f110_gym:f110-v0",
     map=get_map_dir(CURRENT_MAP) + f"/{CURRENT_MAP}_map",
@@ -190,25 +162,21 @@ env = gym.make(
     fov=LIDAR_FOV,
     params=params_dict
 )
-# --- Reset Environment ---
 INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS)
 obs, timestep, _, _ = env.reset(poses=INITIAL_POSES)
-env.render(mode="human") # Render first to create the window/renderer
+env.render(mode="human")
 
-# --- Agent Setup ---
 
 ORIGINAL_WEIGHT = "models/actor/pretrained/actor_pretrained.pt"
-# Force re-pretrain after architecture changes (state normalization fix).
-# Set to None to trigger pretraining; set to path to skip.
 CRITIC_WEIGHT = "models/critic/pretrained/critic_pretrained.pt"
 
 agent = PPOAgent(
-    num_agents=NUM_AGENTS_AI, 
+    num_agents=NUM_AGENTS_AI,
     map_name=CURRENT_MAP,
     steps=STEPS_PER_GENERATION,
     params=params_dict,
     transfer=[ORIGINAL_WEIGHT, CRITIC_WEIGHT],
-    tbtt_length=512,                    # ~5 s of driving context for turn-level learning
+    tbtt_length=512,
 )
 pp_driver = PurePursuit(
     map_name=CURRENT_MAP,
@@ -218,14 +186,7 @@ pp_driver = PurePursuit(
     min_speed=1.5,
 )
 
-# NOTE: torch.compile is DISABLED — Mamba2's custom CUDA kernels
-# (causal_conv1d, selective_scan) cause segfaults with the inductor
-# backend due to in-place SSM state mutation during mamba.step().
-# if hasattr(torch, 'compile'):
-#     agent.actor_network = torch.compile(agent.actor_network)
-#     agent.critic_network = torch.compile(agent.critic_network)
-
-# --- Critic Pretraining (live rollouts with real reward function) ---
+# torch.compile stays disabled for Mamba2 recurrent step() stability.
 ALL_PRETRAIN_MAPS = EASY_MAPS + MEDIUM_MAPS
 if CRITIC_WEIGHT is None:
     agent.pretrain_critic(
@@ -239,11 +200,9 @@ if CRITIC_WEIGHT is None:
         lr=3e-4,
         batch_size=1024,
         save_demos_path="demos/critic_demos.pt",
-        # load_demos_path="demos/critic_demos.pt",  # Reminder: Force fresh collection after architecture changes
     )
     CRITIC_WEIGHT = "models/critic/pretrained/critic_pretrained.pt"
 
-# Generate a fresh random track to start training on
 def _validate_procedural_track(map_name, n_steps=40, crash_window=10):
     """Smoke-test a freshly generated track with pure-pursuit.
 
@@ -415,21 +374,16 @@ def _switch_to_eval_map(map_name):
     return INITIAL_POSES
 
 
-CRITIC_WARMUP_GENS = _env_int("TR_CRITIC_WARMUP_GENS", 4)  # Skip actor updates for first N gens after map switch (bumped 4->6 to give critic time to settle after each rotation)
-MAPS_PER_GEN = _env_int("TR_MAPS_PER_GEN", 3)  # Option B: rotate through K maps within one generation for
-                  # heterogeneous PPO minibatches. Set to 1 for single-map gens.
+CRITIC_WARMUP_GENS = _env_int("TR_CRITIC_WARMUP_GENS", 4)
+MAPS_PER_GEN = _env_int("TR_MAPS_PER_GEN", 3)
 agent.mixed_map_generation = MAPS_PER_GEN > 1
 
 
 def _update_steps_and_buffer(raceline_length):
-    """Set STEPS_PER_GENERATION = 20 * track_length.  TBTT length is fixed
-    at init (512) — enough for turn-level learning; the SSM state carries
-    longer context forward as a detached prior."""
+    """Resize rollout length and normalize progress reward for a map."""
     global STEPS_PER_GENERATION
     STEPS_PER_GENERATION = int(raceline_length) * 5
 
-    # Normalize progress reward so total available reward per lap is ~500
-    # regardless of track length (keeps reward distribution stable across maps)
     agent.PROGRESS_REWARD = 500.0 / max(raceline_length, 1.0)
 
     agent.reset_buffers()
@@ -437,7 +391,7 @@ def _update_steps_and_buffer(raceline_length):
           f"(track={raceline_length:.1f}m, progress_r={agent.PROGRESS_REWARD:.3f}/m)")
 
 
-_switch_to_real_map(CURRENT_MAP)  # Start on a pretrained map for easier initial optimisation
+_switch_to_real_map(CURRENT_MAP)
 agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
 obs, _, _, _ = env.reset(poses=INITIAL_POSES)
 
@@ -446,11 +400,10 @@ print(f"Starting training on {agent.device} for {TOTAL_TIMESTEPS} timesteps...")
 best_dist_per_collision = -float('inf')
 best_per_map = {}  # {map_name: best composite score on that map}
 best_generalist_score = -float('inf')
-best_generalist_dpc = -float('inf')  # Reported alongside composite score
+best_generalist_dpc = -float('inf')
 patience = 0
-_critic_warmup_remaining = 0  # Counts down critic-only warmup generations after map switch
+_critic_warmup_remaining = 0
 
-# --- Resume from checkpoint if available ---
 CHECKPOINT_PATH = _env_str("TR_CHECKPOINT_PATH", "models/checkpoint.pt")
 resumed = None if SKIP_RESUME else agent.load_checkpoint(CHECKPOINT_PATH)
 start_gen = 0
@@ -464,13 +417,10 @@ if resumed is not None:
     )
 
 collision_timers = np.zeros(NUM_AGENTS, dtype=np.int32)
-COLLISION_RESET_THRESHOLD = 20  # ~0.2s wall contact before reset (was 1 = instant)
+COLLISION_RESET_THRESHOLD = 20
 
 total_steps_done = start_gen * STEPS_PER_GENERATION
 gen = start_gen
-# Option B: persistent "focus map" for best-per-map tracking. The env may
-# rotate through other maps within a generation, but performance is scored
-# against this focus map (set by the curriculum at GEN_PER_MAP boundaries).
 focus_map = CURRENT_MAP
 while total_steps_done < TOTAL_TIMESTEPS and (MAX_GENERATIONS <= 0 or gen < MAX_GENERATIONS):
     collisions = 0
@@ -485,15 +435,11 @@ while total_steps_done < TOTAL_TIMESTEPS and (MAX_GENERATIONS <= 0 or gen < MAX_
     current_gen_time = 0.0
     reward_component_sums = {}  # running sums for per-component diagnostics
 
-    # --- Option B: pick K maps for this generation, rotate through them ---
-    # The first is the "focus" map (tracked via best_per_map); the others
-    # are random samples from the curriculum pool for minibatch heterogeneity.
-    # If MAPS_PER_GEN <= 1, this is a no-op.
+    # Rotate through extra maps for heterogeneous PPO minibatches.
     if MAPS_PER_GEN > 1 and not _last_generated_track:
         _pool = get_curriculum_map_pool(gen)
         if focus_map not in _pool:
             focus_map = random.choice(_pool)
-        # Ensure env matches the focus map at the start of the generation
         if CURRENT_MAP != focus_map:
             _switch_map_keep_buffer(focus_map)
             obs, _, _, _ = env.reset(poses=INITIAL_POSES)
@@ -509,40 +455,34 @@ while total_steps_done < TOTAL_TIMESTEPS and (MAX_GENERATIONS <= 0 or gen < MAX_
             _segment_steps * (i + 1) for i in range(MAPS_PER_GEN - 1)
         )
         _map_rotation_idx = 0
-        print(f"  [Option B] Multi-map gen: {_gen_maps} "
+        print(f"  [multi-map] gen maps: {_gen_maps} "
               f"(segment={_segment_steps} steps each)")
     else:
         _gen_maps = [CURRENT_MAP]
         _switch_boundaries = set()
 
     for step in range(STEPS_PER_GENERATION):
-        # --- Option B: mid-generation map switch (keeps rollout buffer) ---
         if step in _switch_boundaries:
             _map_rotation_idx += 1
             _new_map = _gen_maps[_map_rotation_idx]
-            print(f"\n  [Option B] step {step}: switching to {_new_map}")
+            print(f"\n  [multi-map] step {step}: switching to {_new_map}")
             _switch_map_keep_buffer(_new_map)
             obs, _, _, _ = env.reset(poses=INITIAL_POSES)
             agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
-            agent.reset_buffers()  # Reset SSM state so temporal context doesn't
-                                    # bleed across unrelated tracks
+            agent.reset_buffers()
             collision_timers[:] = 0
             pp_driver.update_map(CURRENT_MAP)
 
         timer = time.time()
         done_np = np.zeros(NUM_AGENTS, dtype=np.int32)
-        
-        # env.render(mode="human_fast")
-        
-        # Get Action from Agent
+
         scan_tensors, state_tensor = agent._obs_to_tensors(obs)
         action_tensor, log_prob_tensor, value_tensor = agent.get_action_and_value(
             scan_tensors, state_tensor
         )
-                
-        # Convert to NumPy for the Gym environment
+
         action_np = action_tensor.cpu().numpy()
-        
+
         if action_np.shape[0] < NUM_AGENTS:
             # Fill in the remaining agents with Pure Pursuit actions
             n_pp = NUM_AGENTS - action_np.shape[0]
@@ -550,58 +490,57 @@ while total_steps_done < TOTAL_TIMESTEPS and (MAX_GENERATIONS <= 0 or gen < MAX_
             pp_acts = np.array([pp_driver.get_action(obs, agent_idx=pp_start + j)
                                 for j in range(n_pp)], dtype=np.float32)
             action_np = np.vstack((action_np, pp_acts))
-        
-        # Step the Environment
+
         next_obs, timestep, _, _ = env.step(action_np)
 
         # Track forward distance travelled by AI agents (meters)
         ai_speeds = np.clip(next_obs['linear_vels_x'][:NUM_AGENTS_AI], 0.0, None)
         total_distance_this_gen += float(np.sum(ai_speeds) * float(max(timestep, 0.0)))
-        
+
         # Calculate Reward
         rewards_list, avg_reward = agent.calculate_reward(next_obs, action=action_np)
-        
+
         # Accumulate per-component reward diagnostics
         for k, v in agent._reward_components.items():
             reward_component_sums[k] = reward_component_sums.get(k, 0.0) + v
-        
+
         # Update collision timers
         current_collisions = np.array(next_obs['collisions'][:NUM_AGENTS])
         collision_timers[(current_collisions == 1)] += 1
         collision_timers[current_collisions == 0] = 0
-        
+
         agents_to_reset = np.where(collision_timers >= COLLISION_RESET_THRESHOLD)[0]
-        
+
         if len(agents_to_reset) > 0:
             # Generate new poses for stuck agents
             poses = np.array([[x, y, theta] for x, y, theta in zip(
                 next_obs['poses_x'], next_obs['poses_y'], next_obs['poses_theta']
             )])
             INITIAL_POSES = generate_start_poses(CURRENT_MAP, NUM_AGENTS, agent_poses=poses)
-            
+
             # Reset the environment for stuck agents
             next_obs, _, _, _ = env.reset(poses=INITIAL_POSES, agent_idxs=agents_to_reset)
-            
+
             # Reset agent buffers and trackers
             ai_agents_to_reset = agents_to_reset[agents_to_reset < NUM_AGENTS_AI]
             if len(ai_agents_to_reset) > 0:
                 agent.reset_buffers(ai_agents_to_reset)
             agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2], agent_idxs=agents_to_reset)
-            
+
             # Reset collision timers for these agents
             collision_timers[agents_to_reset] = 0
-            
+
             # Count these as collision exits
             collisions += len(agents_to_reset[agents_to_reset < NUM_AGENTS_AI])
-            
+
             done_np[agents_to_reset] = 1
-        
+
         total_reward_this_gen.append(avg_reward)
         ego_reward_this_gen.append(rewards_list[0])
-        
+
         # Calculate time
         current_gen_time += timestep
-        
+
         # Store Experience
         agent.store_transition(
             obs=[scan_tensors, state_tensor],
@@ -612,7 +551,7 @@ while total_steps_done < TOTAL_TIMESTEPS and (MAX_GENERATIONS <= 0 or gen < MAX_
             done=done_np[:NUM_AGENTS_AI],
             value=value_tensor,
         )
-        
+
         done_np = np.zeros(NUM_AGENTS, dtype=np.int32)
 
         # Periodic CUDA sync: surfaces async kernel errors as catchable
@@ -628,9 +567,9 @@ Max actor_vel: {torch.max(action_tensor[:,1]).item():.1f} m/s, \
 Ego Speed: {next_obs['linear_vels_x'][0]:.2f} \
 Avg Reward: {sum(total_reward_this_gen) / (step + 1):.3f} \
 S/s: {1 / (time.time() - timer):.1f}", end='\r')
-        
+
         obs = next_obs
-    
+
     total_steps_done += STEPS_PER_GENERATION
     print() # Finish the carriage return line
 
@@ -640,11 +579,9 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
     print(f"  Reward breakdown (avg/step): {comp_str}")
 
     current_physics_time = 0.0
-    
-    # --- END OF GENERATION ---
-    # Flush the last pending transition with a bootstrap value estimate
+
     agent.finalize_rollout(obs)
-    
+
     reward_avg = sum(total_reward_this_gen) / len(total_reward_this_gen)
     current_avg_ego_reward = sum(ego_reward_this_gen) / len(total_reward_this_gen)
     dist_per_collision = total_distance_this_gen / max(collisions, 1)
@@ -657,10 +594,7 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
         progress_per_step=progress_per_step,
     )
 
-    # Compare against best on *this* map only — difficulty varies across tracks,
-    # so a global best is not a meaningful improvement target after map switches.
-    # Option B: score the generation against the focus_map (primary track),
-    # not CURRENT_MAP which may be the last segment in the rotation.
+    # Score multi-map generations against the focus map, not the final segment.
     _score_map = focus_map if MAPS_PER_GEN > 1 else CURRENT_MAP
     map_best = best_per_map.get(_score_map, -float('inf'))
     is_improvement = (
@@ -700,17 +634,12 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
             f"gate={selection_gate:.2f}). "
             f"Patience: {patience}"
         )
-        
+
     critic_only = _critic_warmup_remaining > 0
     if critic_only:
         _critic_warmup_remaining -= 1
         print(f"  [Critic warmup] {_critic_warmup_remaining} gens remaining — skipping actor update")
 
-    # --- Per-generation metadata (focus map, geometric difficulty, EMA) ---
-    # Logged to the diagnostics CSV for offline analysis.  Difficulty is
-    # computed from the focus map's currently loaded raceline so it works
-    # uniformly for real and procedural tracks.  Must be set *before*
-    # ``agent.learn(...)`` since learn() triggers the CSV dump.
     _is_procedural = bool(_last_generated_track) or str(focus_map).startswith("gen_track")
     _map_type = "procedural" if _is_procedural else "real"
     try:
@@ -726,9 +655,6 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
         difficulty=_diff,
         raceline_length=float(getattr(agent, "raceline_length", 0.0) or 0.0),
         dist_per_collision=dist_per_collision,
-        # Per-component reward averages (per step) — early-warning signal
-        # for the slow-collapse failure mode where progress reward goes to
-        # zero while collision penalty term stays bounded.
         progress_per_step=progress_per_step,
         checkpoint_per_step=float(reward_component_sums.get("checkpoint", 0.0)) / float(n),
         wall_col_per_step=float(reward_component_sums.get("wall_col", 0.0)) / float(n),
@@ -740,15 +666,8 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
     )
 
     agent.learn(collisions, reward_avg, critic_only=critic_only)
-    
-        
-    # if patience >= PATIENCE:
-    #     print("Early stopping triggered due to no improvement.")
-    #     break
-    
-    # --- Switch to a new random track every GEN_PER_MAP generations ---
+
     if gen % GEN_PER_MAP == 0:
-        # --- Held-out generalization evaluation (before switching curriculum map) ---
         if (not DISABLE_HELDOUT_EVAL) and gen % HELDOUT_EVAL_EVERY == 0 and len(HELDOUT_MAPS) > 0:
             eval_results = {}
             eval_scores = {}
@@ -838,7 +757,7 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
         else:
             _switch_to_new_track(gen)
             focus_map = CURRENT_MAP  # Generated track: disables Option B rotation
-            
+
         print(f"Gen {gen}: New focus map \u2192 {CURRENT_MAP}  "
               f"(steps/gen={STEPS_PER_GENERATION})")
         agent.last_cumulative_distance = np.zeros(NUM_AGENTS_AI)
@@ -856,7 +775,7 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
             print(f"  [map-best] {CURRENT_MAP} previous best score: {prev_best:.3f}")
         else:
             print(f"  [map-best] {CURRENT_MAP} first visit")
-        
+
 
 agent.save_checkpoint(CHECKPOINT_PATH, generation=gen, best_reward=best_dist_per_collision)
 agent.save_weights("models/actor/checkpoint/actor_gen_FINAL.pt",
@@ -868,7 +787,7 @@ if _last_generated_track is not None:
     old_dir = os.path.join("maps", _last_generated_track)
     if os.path.isdir(old_dir):
         shutil.rmtree(old_dir, ignore_errors=True)
-        
+
 # --- END OF TRAINING ---
 env.close()
 print("Training complete.")

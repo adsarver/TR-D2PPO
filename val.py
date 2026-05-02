@@ -27,26 +27,12 @@ from D2PPO_agent import D2PPOAgent as PPOAgent
 from baselines.gap_follow_pure_pursuit import GapFollowPurePursuit
 from baselines.mpc_agent import MPCAgent
 from track_generator import TrackGenerator
+from utils.sim_config import LIDAR_BEAMS, LIDAR_FOV, SIM_PARAMS
 from utils.utils import get_map_dir, generate_start_poses
 
-# ──────────────────────────────────────────────────────────────────────
-# Car physics (must match train.py / simulator)
-# ──────────────────────────────────────────────────────────────────────
-PARAMS_DICT = {
-    "mu": 1.0489, "C_Sf": 4.718, "C_Sr": 5.4562,
-    "lf": 0.15875, "lr": 0.17145, "h": 0.074, "m": 3.74,
-    "I": 0.04712, "s_min": -0.34, "s_max": 0.34,
-    "sv_min": -3.2, "sv_max": 3.2, "v_switch": 7.319,
-    "a_max": 9.51, "v_min": -5.0, "v_max": 20.0,
-    "width": 0.31, "length": 0.58,
-}
+PARAMS_DICT = SIM_PARAMS.copy()
 WHEELBASE = PARAMS_DICT["lf"] + PARAMS_DICT["lr"]
-LIDAR_BEAMS = 1080
-LIDAR_FOV = 4.7
 
-# ──────────────────────────────────────────────────────────────────────
-# Best baseline parameters (from grid search)
-# ──────────────────────────────────────────────────────────────────────
 BEST_GFPP_PARAMS = {
     "lookahead_distance": 1.4,
     "threshold_at_v_min": 1.0,
@@ -58,9 +44,6 @@ BEST_MPC_PARAMS = {
     "emergency_dist": 0.8,
 }
 
-# ──────────────────────────────────────────────────────────────────────
-# Defaults
-# ──────────────────────────────────────────────────────────────────────
 NUM_AGENTS = 3  # D2PPO, GFPP, MPC
 AGENT_NAMES = ["D2PPO", "GFPP", "MPC"]
 DEFAULT_ACTOR = "actor_gen_36.pt"
@@ -137,24 +120,20 @@ def run_race(env, d2ppo, gfpp, mpc, map_name, num_laps, render, max_speed):
     sim_time = 0.0
 
     while sim_time < LAP_TIMEOUT:
-        # --- D2PPO action (agent 0) ---
         scan_t, state_t = d2ppo._obs_to_tensors(obs)
         action_t, _, _ = d2ppo.get_action_and_value(
             scan_t, state_t, deterministic=True
         )
         d2ppo_action = action_t.cpu().numpy()  # (num_d2ppo_agents, 2)
 
-        # --- Baseline actions (agents 1, 2) ---
         gfpp_action = gfpp.get_action(obs, agent_idx=1)
         mpc_action = mpc.get_action(obs, agent_idx=2)
 
-        # Assemble action array for all agents
         actions = np.zeros((NUM_AGENTS, 2), dtype=np.float32)
         actions[0] = d2ppo_action[0]
         actions[1] = gfpp_action
         actions[2] = mpc_action
 
-        # Speed cap
         actions[:, 1] = np.clip(actions[:, 1], 0.0, max_speed)
 
         next_obs, step_time, _, _ = env.step(actions)
@@ -163,14 +142,12 @@ def run_race(env, d2ppo, gfpp, mpc, map_name, num_laps, render, max_speed):
         if render:
             env.render(mode="human")
 
-        # --- Collision tracking ---
         for i in range(NUM_AGENTS):
             if next_obs["collisions"][i] == 1:
                 collision_dur[i] += step_time
                 if collision_dur[i] > COLLISION_TIMEOUT:
                     collision_counts[i] += 1
                     collision_dur[i] = 0.0
-                    # Reset this agent
                     cur_poses = np.stack([
                         next_obs["poses_x"], next_obs["poses_y"],
                         next_obs["poses_theta"],
@@ -183,7 +160,6 @@ def run_race(env, d2ppo, gfpp, mpc, map_name, num_laps, render, max_speed):
             else:
                 collision_dur[i] = 0.0
 
-        # --- Lap tracking ---
         for i in range(NUM_AGENTS):
             new_laps = int(next_obs["lap_counts"][i])
             if new_laps > lap_counts[i]:
@@ -191,14 +167,12 @@ def run_race(env, d2ppo, gfpp, mpc, map_name, num_laps, render, max_speed):
                 lap_start[i] = sim_time
                 lap_counts[i] = new_laps
 
-        # Check if all agents finished or all timed out
         all_done = all(lap_counts[i] >= num_laps for i in range(NUM_AGENTS))
         if all_done:
             break
 
         obs = next_obs
 
-        # Print live status
         status_parts = []
         for i, name in enumerate(AGENT_NAMES):
             v = obs["linear_vels_x"][i]
@@ -225,7 +199,6 @@ def run_race(env, d2ppo, gfpp, mpc, map_name, num_laps, render, max_speed):
 def main():
     args = parse_args()
 
-    # --- Track Generator ---
     track_gen = TrackGenerator(
         min_track_length=150,
         max_track_length=1500,
@@ -237,7 +210,6 @@ def main():
         seed=None,
     )
 
-    # --- Create initial env on a throwaway map (will be replaced) ---
     init_map = "Hockenheim"
     env = gym.make(
         "f110_gym:f110-v0",
@@ -252,7 +224,6 @@ def main():
     if args.render:
         env.render(mode="human")
 
-    # --- D2PPO Agent ---
     d2ppo = PPOAgent(
         num_agents=1,
         map_name=init_map,
@@ -261,14 +232,12 @@ def main():
         transfer=[args.actor, args.critic],
     )
 
-    # Enable deployment optimisations (DDIM-few + action repeat + fp16)
     if not args.no_deploy:
         d2ppo.deploy(
             action_repeat=args.action_repeat,
             ddim_steps=args.ddim_steps,
         )
 
-    # --- Race Loop ---
     print(f"\n{'=' * 70}")
     print(f"  VALIDATION — D2PPO vs GFPP vs MPC on random generated tracks")
     print(f"  Races: {args.races}   Laps per race: {args.laps}")
@@ -276,11 +245,10 @@ def main():
     print(f"  Baseline speed cap: {args.speed} m/s")
     print(f"{'=' * 70}\n")
 
-    all_results = []  # list of per-race results
+    all_results = []
     last_track = None
 
     for race_idx in range(args.races):
-        # Clean up previous generated track
         if last_track is not None:
             old_dir = os.path.join("maps", last_track)
             if os.path.isdir(old_dir):
@@ -332,7 +300,6 @@ def main():
         if os.path.isdir(old_dir):
             shutil.rmtree(old_dir, ignore_errors=True)
 
-    # ── Final summary ────────────────────────────────────────────
     print(f"\n{'=' * 70}")
     print(f"  FINAL SUMMARY  ({args.races} races, {args.laps} laps each)")
     print(f"{'=' * 70}")

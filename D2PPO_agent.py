@@ -34,12 +34,13 @@ from models.AuxModels import VisionEncoder
 from models.CriticNetworks import CriticNetwork, Mamba2CriticNetwork
 from models.DiffusionMamba2 import DiffusionMamba2
 from utils.diffusion_utils import extract, dispersive_loss_infonce_l2
+from utils.sim_config import D2PPO_STATE_DIM, LIDAR_BEAMS, LIDAR_FOV
 
 
 class D2PPOAgent:
     """
     D²PPO Agent: Diffusion Policy Policy Optimization.
-    
+
     Follows the same interface as PPOAgent for compatibility with the F1Tenth
     training loop (train.py), but replaces the Gaussian policy with a diffusion
     policy.  Pure RL — no supervised / BC pre-training.
@@ -153,68 +154,44 @@ class D2PPOAgent:
         tbtt_length=512,
         ddim_k=5, # 1 for training, 0 for eval, 5 for fine-tune
     ):
-        # --- Hyperparameters ---
         self.num_agents = num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.lr_actor = 1e-5          # Lowered from 3e-5 after seeing actor_grad_norm
-                                       # spike to 7000 at gen 7 (training divergence).
-        self.lr_critic = 5e-5         # Lowered from 1e-4 after CSV showed critic see-saw
-                                       # on map switches: clean fit on Map A then overshoot
-                                       # on Map B (pre-clip grad norms 22-75, reward collapse
-                                       # gen 32). Halving LR halves the see-saw amplitude
-                                       # while keeping enough signal to escape ~0.5 stagnation.
-        self.gamma = 0.999            # Paper uses 0.999; rollouts are 512-9600 steps
+        self.lr_actor = 1e-5
+        self.lr_critic = 5e-5
+        self.gamma = 0.999
         self.gae_lambda = 0.95
-        self.clip_epsilon = 0.2        # Value-clipping range for critic (standard PPO)
+        self.clip_epsilon = 0.2
         self.max_grad_norm_actor = 0.5
         self.max_grad_norm_critic = 1.0
-        self.state_dim = 3
-        self.num_scan_beams = 1080
-        self.lidar_fov = 4.7
+        self.state_dim = D2PPO_STATE_DIM
+        self.num_scan_beams = LIDAR_BEAMS
+        self.lidar_fov = LIDAR_FOV
         self.minibatch_size = 128
         self.epochs = 4
         self.params = params
 
-        # --- TBTT config ---
         self.tbtt_length = tbtt_length
 
-        # --- Advantage-weighted diffusion config ---
         self.num_diffusion_steps = num_diffusion_steps
-        self.awr_temperature = 0.5    # β for exp(A/β) — lower = sharper advantage weighting
-        self.awr_max_weight = 10.0    # Clamp max weight for stability (lowered from 20
-                                       # to reduce extreme AWR-weighted update variance).
-        self.diff_reg_lambda = 0.02  # Diffusion regulariser — keep denoising quality but
-                                       # do NOT dominate the PPO gradient (was 0.1 → ~50%
-                                       # of the PPO signal, crushed policy improvement).
-        self.dispersive_lambda = 0.1  # Paper value. Our Gen-160 collapse was textbook
-                                       # mode-collapse (standstill attractor across all
-                                       # agents); dispersive InfoNCE-L2 is the exact
-                                       # anti-collapse regulariser. With kl_target=0.5
-                                       # the PPO signal is large enough to coexist.
+        self.awr_temperature = 0.5
+        self.awr_max_weight = 10.0
+        self.diff_reg_lambda = 0.02
+        self.dispersive_lambda = 0.1
         self.dispersive_temperature = 0.5
-        self.use_dispersive_in_rl = True  # Re-enabled to combat sporadic
-                                          # jerk-induced collisions caused by
-                                          # spiky / mode-collapsed action dist.
-        self.dispersive_coef_rl = 0.03    # Half the BC value (0.1). The tighter
-                                          # RL trust region (kl_early_stop=0.15)
-                                          # means a smaller dispersive gradient
-                                          # is needed to avoid blowing out KL
-                                          # and triggering chronic early-stops.
+        self.use_dispersive_in_rl = True
+        self.dispersive_coef_rl = 0.03
 
-        # --- PPO clipped objective for diffusion (DPPO-style) ---
         self.ppo_clip_coef = 0.1
-        self.use_ppo_diffusion = True  # True = PPO clipped objective, False = AWR (legacy)
+        self.use_ppo_diffusion = True
         self.kl_target = 0.5
         self.kl_early_stop = 1.0
-        self._old_denoise_net = None   # Snapshot of denoising MLP for importance ratio
-        self._last_denoising_chain = None  # Cached chain from last rollout step
-        self._last_ddim_schedule = None    # DDIM timestep schedule from last rollout step
+        self._old_denoise_net = None
+        self._last_denoising_chain = None
+        self._last_ddim_schedule = None
 
-        # --- DDIM config for RL rollouts (D2PPO paper uses DDIM, not full DDPM) ---
-        self._ddim_rl_steps = 10      # Paper Table 6: 10 fine-tuning denoising steps
-        self._ddim_rl_eta = 0.5       # Stochasticity (>0 required for log-prob computation)
+        self._ddim_rl_steps = 10
+        self._ddim_rl_eta = 0.5
 
-        # --- Waypoints for Raceline Reward ---
         self.waypoints_xy, self.waypoints_s, self.raceline_length = self._load_waypoints(map_name)
         self.last_cumulative_distance = np.zeros(self.num_agents)
         self.last_wp_index = np.zeros(self.num_agents, dtype=np.int32)
@@ -222,61 +199,29 @@ class D2PPOAgent:
         self.current_lap_count = np.zeros(self.num_agents, dtype=int)
         self.last_checkpoint = np.zeros(self.num_agents, dtype=int)
 
-        # --- Reward Scalars ---
-        self.LAP_REWARD = 10.0            # Small bonus; bulk of lap incentive comes from progress (200) + checkpoints
-        self.CHECKPOINT_REWARD = 1.0      # 10 checkpoints × 1.0 = 10 total per lap
+        self.LAP_REWARD = 10.0
+        self.CHECKPOINT_REWARD = 1.0
         self.COLLISION_PENALTY = -5.0
         self.PROGRESS_REWARD = 1.0
         self.AGENT_COLLISION_PENALTY = -1.0
         self.NUM_CHECKPOINTS = 10
-        # --- Smoothness + speed shaping ---
-        # Steering-rate (wiggle) penalty: -k * |steer_t - steer_{t-1}|.
-        # Bumped 5× from -0.1 → -0.5 because at the previous level the
-        # speed-bonus gradient (~0.058/step) dwarfed the smoothness
-        # gradient (~0.003/step) and the policy traded smoothness for
-        # speed.  Set 0 to disable.
         self.STEER_RATE_PENALTY = -0.5
-        # Absolute steering penalty: -k * |steer_t|.  DISABLED (was -0.05).
-        # The rate penalty alone is sufficient for smoothness; the abs
-        # penalty was suppressing legitimate cornering steer (|steer|≈0.25
-        # is needed for tight turns), causing understeer-into-walls.
-        # action_steer_abs_mean dropped 0.087→0.070 with this active, but
-        # wall_col_per_step *tripled* (-0.011→-0.034) because the agent
-        # couldn't generate enough turn input.  Set non-zero to re-enable.
         self.STEER_ABS_PENALTY = 0.0
-        # Linear above-floor speed bonus, paid only when making forward
-        # progress and not colliding.  Encourages reaching 12-15 m/s
-        # without re-introducing the quadratic-progress slow-collapse
-        # attractor that came from the old speed_mult.  Reduced from
-        # 0.010 → 0.008 because the agent was commanding too-high
-        # speed into corners (5× wall-collision rate at 0.010).
         self.SPEED_BONUS = 0.008
-        self.SPEED_BONUS_FLOOR = 3.0      # m/s — bonus pays above this
-        self.SPEED_BONUS_CAP = 10.0       # m/s — bonus saturates here
-                                          # (was 15.0 — lowered because the
-                                          # agent was commanding 11+ m/s
-                                          # which the chassis cannot follow,
-                                          # producing slide-into-wall events)
-        # Curvature gate: full speed bonus only when |steer| ≈ 0;
-        # linear ramp to zero at |steer| = SPEED_BONUS_STEER_GATE.
-        # This directly encodes "fast on straights, slow in corners".
-        # Set to a large value (e.g. 10.0) to disable gating.
-        self.SPEED_BONUS_STEER_GATE = 0.2  # rad
+        self.SPEED_BONUS_FLOOR = 3.0
+        self.SPEED_BONUS_CAP = 10.0
+        self.SPEED_BONUS_STEER_GATE = 0.2
         self._prev_lap_counts = np.zeros(self.num_agents, dtype=int)
         self._was_colliding_wall = np.zeros(self.num_agents, dtype=bool)
         self._was_colliding_agent = np.zeros(self.num_agents, dtype=bool)
-        # Previous-step steering command, for steer-rate penalty.
         self._last_steer = np.zeros(self.num_agents, dtype=np.float64)
 
-        # --- Running reward normalisation (EMA across generations) ---
         self._reward_ema_mean = 0.0
         self._reward_ema_var = 1.0
 
-        # --- Networks ---
         actor_encoder = self._transfer_vision(transfer[0])
         critic_encoder = self._transfer_vision(transfer[0])
 
-        # Diffusion Policy Actor (Mamba2 temporal backbone)
         self.actor_network = DiffusionMamba2(
             state_dim=self.state_dim,
             action_dim=2,
@@ -295,10 +240,8 @@ class D2PPOAgent:
             odom_expand=64,
         ).to(self.device)
 
-        # Register dispersive hooks on last denoiser block (same as pretraining)
         self.actor_network.denoise_net.register_dispersive_hooks("late")
 
-        # Critic with Mamba2 temporal backbone (mirrors actor architecture)
         self.critic_network = Mamba2CriticNetwork(
             state_dim=self.state_dim,
             encoder=critic_encoder,
@@ -313,7 +256,6 @@ class D2PPOAgent:
         self.actor_network = self._transfer_weights(transfer[0], self.actor_network)
         self.critic_network = self._transfer_weights(transfer[1], self.critic_network)
 
-        # --- Model parameter summary ---
         actor_params = sum(p.numel() for p in self.actor_network.parameters())
         actor_train = sum(p.numel() for p in self.actor_network.parameters() if p.requires_grad)
         critic_params = sum(p.numel() for p in self.critic_network.parameters())
@@ -338,28 +280,20 @@ class D2PPOAgent:
         print(f"  Dispersive:      lambda={self.dispersive_lambda}  temp={self.dispersive_temperature}  rl={self.use_dispersive_in_rl} (coef_rl={self.dispersive_coef_rl})")
         print(f"{'='*60}\n")
 
-        # --- Optimizers ---
         self.actor_optimizer = optim.AdamW(
             self.actor_network.parameters(), lr=self.lr_actor, weight_decay=0
         )
         self.critic_optimizer = optim.AdamW(
             self.critic_network.parameters(), lr=self.lr_critic, weight_decay=0
         )
-        # --- On-policy transition storage (ordered list for correct GAE) ---
         self.buffer = []
         self._last_obs_features = None  # Cached by get_action_and_value for store_transition
         self._pending_transition = None  # Deferred write for next/state_value
 
-        # --- Post-warmup actor LR ramp ---
-        # After a critic-only warmup ends, the actor faces a freshly-changed
-        # advantage landscape and tends to blow KL on the first gen. Scale the
-        # actor LR for the first POST_WARMUP_RAMP_GENS gens after warmup ends
-        # to soften the trust-region hit. Schedule: 0.25x, 0.5x, 1.0x.
         self.POST_WARMUP_RAMP_GENS = int(os.getenv("TR_POST_WARMUP_RAMP_GENS", "2"))
         self._post_warmup_remaining = 0
         self._was_critic_only_last_gen = False
 
-        # --- Diagnostics ---
         self.plot_save_path = os.getenv("TR_PLOT_PATH", "plots/d2ppo_training_diagnostics.png")
         plot_dir = os.path.dirname(self.plot_save_path)
         if plot_dir and not os.path.exists(plot_dir):
@@ -372,11 +306,9 @@ class D2PPOAgent:
             "clipfrac", "actor_early_stops",
             "collisions", "reward", "avg_speed",
             "dist_per_collision",
-            # --- Map-agnostic performance metrics ---
             "laps_per_collision",   # track-length-normalised survival
             "speed_ratio",          # avg_speed / raceline_mean_speed (1.0 = expert pace)
             "progress_score",       # laps_per_collision * speed_ratio (combined KPI)
-            # --- Action-distribution sanity (slow-collapse early-warning) ---
             "action_velocity_mean",  # mean of action[:, 1] across rollout buffer (m/s)
             "action_velocity_min",   # minimum velocity command in the rollout
             "action_steer_abs_mean", # mean |action[:, 0]| (steering aggressiveness)
@@ -402,13 +334,12 @@ class D2PPOAgent:
 
 
 
-        # --- Deployment mode ---
         self._deploy_mode = False
         self._deploy_action_repeat = 0      # run inference every N sim steps
         self._deploy_ddim_steps = 1         # DDIM steps in deploy mode (paper: 0 intermediate = 1 call)
         self._cached_action = None          # last action for repeating
         self._action_repeat_counter = 0     # counts sim steps since last inference
-        
+
     def clear_experience_buffer(self):
         self.buffer = []
         self._pending_transition = None
@@ -475,9 +406,6 @@ class D2PPOAgent:
             except (TypeError, ValueError):
                 pass
 
-    # ------------------------------------------------------------------
-    # Deployment mode  (optimised for Jetson Orin Nano ~100 Hz)
-    # ------------------------------------------------------------------
     def deploy(self, action_repeat=0, ddim_steps=1, compile_model=True):
         """Switch to optimised deployment inference.
 
@@ -499,7 +427,6 @@ class D2PPOAgent:
         self._cached_action = None
         self._action_repeat_counter = 0
 
-        # Drop critic — not needed during deployment
         if hasattr(self, 'critic_network'):
             del self.critic_network
             del self.critic_optimizer
@@ -518,9 +445,6 @@ class D2PPOAgent:
         print(f"[deploy] DDIM-{self._deploy_ddim_steps}, "
               f"action_repeat={self._deploy_action_repeat}")
 
-    # ------------------------------------------------------------------
-    # Temporal state reset  (zeros the Mamba2 rolling feature buffers)
-    # ------------------------------------------------------------------
     def reset_temporal_state(self, agent_idxs=None):
         """Reset internal temporal buffers on actor and critic networks.
 
@@ -532,12 +456,8 @@ class D2PPOAgent:
         if hasattr(self, 'critic_network'):
             self.critic_network.reset_temporal_state(agent_idxs)
 
-    # Backwards-compatible alias used by train.py, val.py, etc.
     reset_buffers = reset_temporal_state
 
-    # ------------------------------------------------------------------
-    # Critic pretraining  (run once before RL loop)
-    # ------------------------------------------------------------------
     def pretrain_critic(self, env, pp_driver, num_agents_total, maps,
                         rollout_steps=512, num_rollouts=3, epochs=10,
                         lr=1e-4, batch_size=256,
@@ -959,13 +879,13 @@ class D2PPOAgent:
 
         print(f"  Critic pretraining complete.  Best loss: {best_loss:.4f}")
         print("=" * 60 + "\n")
-    
+
     def get_action_and_value(self, scan_tensor, state_tensor, deterministic=False, store=True):
         """
         Sample an action from the diffusion policy and compute state value.
-        
+
         Compatible with PPOAgent interface: returns (action, log_prob, value).
-        
+
         When ``store=True`` the observation buffers are
         advanced (used during rollout collection).  When ``store=False`` we
         only need the value estimate (e.g. for bootstrapping next-state value)
@@ -2575,30 +2495,30 @@ class D2PPOAgent:
         wp_count = len(self.waypoints_xy)
         search_indices = np.arange(start_idx, start_idx + lookahead) % wp_count
         search_waypoints = self.waypoints_xy[search_indices]
-        
+
         distances_in_window = np.linalg.norm(search_waypoints - current_pos, axis=1)
         closest_wp_in_window = np.argmin(distances_in_window)
         closest_wp_index_global = search_indices[closest_wp_in_window]
-        
+
         W_curr = self.waypoints_xy[closest_wp_index_global]
         W_prev_index = (closest_wp_index_global - 1 + wp_count) % wp_count
         W_prev = self.waypoints_xy[W_prev_index]
-        
+
         V = W_curr - W_prev
         V_len_sq = np.dot(V, V)
         W = current_pos - W_prev
         L = np.dot(W, V) / V_len_sq if V_len_sq > 1e-6 else 0.0
-        
+
         s_prev = self.waypoints_s[W_prev_index]
         s_curr = self.waypoints_s[closest_wp_index_global]
-        
+
         segment_distance = s_curr - s_prev
         if segment_distance < 0:
             segment_distance += self.raceline_length
         projected_s = s_prev + L * segment_distance
-        
+
         return projected_s, closest_wp_index_global
-    
+
     def _transfer_weights(self, path, network):
         if path is None:
             return network.to(self.device)

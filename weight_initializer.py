@@ -42,6 +42,7 @@ from models.DiffusionMamba2 import DiffusionMamba2
 from utils.diffusion_utils import cosine_beta_schedule, linear_beta_schedule
 from utils.diffusion_utils import extract, dispersive_loss_infonce_l2
 from baselines.mpc_agent import MPCAgent
+from utils.sim_config import D2PPO_STATE_DIM, LIDAR_BEAMS, LIDAR_FOV, SIM_PARAMS
 from utils.utils import get_map_dir, generate_start_poses
 
 # Add racing_rl to path for loading pretrained models
@@ -50,26 +51,10 @@ if RACING_RL_PATH not in sys.path:
     sys.path.insert(0, RACING_RL_PATH)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Vehicle / sim parameters  (must match train.py)
-# ──────────────────────────────────────────────────────────────────────
-PARAMS_DICT = {
-    'mu': 1.0489, 'C_Sf': 4.718, 'C_Sr': 5.4562,
-    'lf': 0.15875, 'lr': 0.17145, 'h': 0.074, 'm': 3.74,
-    'I': 0.04712, 's_min': -0.34, 's_max': 0.34,
-    'sv_min': -3.2, 'sv_max': 3.2, 'v_switch': 7.319,
-    'a_max': 9.51, 'v_min': -5.0, 'v_max': 20.0,
-    'width': 0.31, 'length': 0.58,
-}
+PARAMS_DICT = SIM_PARAMS.copy()
+NUM_BEAMS = LIDAR_BEAMS
+STATE_DIM = D2PPO_STATE_DIM
 
-NUM_BEAMS  = 1080
-LIDAR_FOV  = 4.7
-STATE_DIM  = 3
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Demo collection  (multiprocess — one env per map, runs in parallel)
-# ──────────────────────────────────────────────────────────────────────
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
@@ -90,7 +75,7 @@ def _collect_single_map(
     # Each process must import gym afresh (env has C state)
     import gym as _gym
     demos: list[dict] = []
-    
+
     total_agents = num_agents + num_noise_agents
 
     env = _gym.make(
@@ -113,7 +98,7 @@ def _collect_single_map(
         speed_scale=0.8,
         emergency_dist=0.8,
     )
-    
+
     noise_agents = MPCAgent(
         map_name=map_name,
         wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
@@ -138,7 +123,7 @@ def _collect_single_map(
         actions[num_agents:] = noise_actions[:num_noise_agents]  # Add noise agents at the end
         # Last 3 noise agents act as static obstacles (zero steering & velocity)
         actions[-3:] = np.array([0.0, 0.0])
-        
+
         next_obs, _, _, _ = env.step(actions)
 
         # Collision / stuck detection
@@ -333,7 +318,6 @@ def _collect_pretrained_batched(
     total_agents = num_agents + num_noise_agents
     N_total = E * total_agents
 
-    # ── Spawn env worker processes (fork to avoid re-importing module) ─
     ctx = mp.get_context("fork")
     parent_conns = []
     workers = []
@@ -360,7 +344,6 @@ def _collect_pretrained_batched(
         all_s3d.append(s3d)
         all_s4d.append(s4d)
 
-    # ── Load expert model (single instance on GPU) ───────────────────
     encoder = RacingVisionEncoder(num_scan_beams=NUM_BEAMS)
     expert_model = ExampleNetwork(
         state_dim=4, action_dim=2, encoder=encoder,
@@ -391,16 +374,13 @@ def _collect_pretrained_batched(
         print(f"  [Pretrained] Loaded expert — {E} env workers "
               f"({N_total} agents batched, {E} CPU cores)")
 
-    # LSTM hidden states spanning all envs × agents
     obs_buffer = expert_model.create_observation_buffer(N_total, device)
     hidden_h, hidden_c = expert_model.get_init_hidden(
         N_total, device, transpose=True)
 
-    # ── Step loop ────────────────────────────────────────────────────
     demos: list[dict] = []
 
     for step in range(steps_per_map):
-        # 1. Batch observations from all envs → GPU forward pass
         batch_scans = np.concatenate(all_scans, axis=0)
         batch_s4d = np.concatenate(all_s4d, axis=0)
 
@@ -412,19 +392,16 @@ def _collect_pretrained_batched(
                 scan_t, state_t, obs_buffer, hidden_h, hidden_c)
             expert_actions_all = loc.cpu().numpy()
 
-        # 2. Send actions to ALL workers (they step in parallel)
         for e, conn in enumerate(parent_conns):
             off = e * total_agents
             conn.send(expert_actions_all[off:off + total_agents])
 
-        # 3. Receive results from all workers
         new_scans, new_s3d, new_s4d = [], [], []
         for e, conn in enumerate(parent_conns):
             tag, scans, s3d, s4d, demo_meta, reset_all = conn.recv()
             acts, vels, cols, reset_demo = demo_meta
             off = e * total_agents
 
-            # Save demos (using pre-step obs)
             for a_idx in range(num_agents):
                 demos.append({
                     "scan":   all_scans[e][a_idx].copy(),
@@ -438,7 +415,6 @@ def _collect_pretrained_batched(
                     "done": int(a_idx in reset_demo),
                 })
 
-            # Reset LSTM hidden states for reset agents
             for idx in reset_all:
                 g = off + idx
                 obs_buffer[g] = 0.0
@@ -457,7 +433,6 @@ def _collect_pretrained_batched(
             print(f"    step {step}/{steps_per_map}  "
                   f"demos={len(demos)}", flush=True)
 
-    # ── Shutdown workers ─────────────────────────────────────────────
     for conn in parent_conns:
         conn.send(None)
         conn.close()
@@ -568,10 +543,6 @@ def collect_demos_pretrained(
     return demos
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Training loop  (D²PPO Stage 1 — behavioural cloning)
-# ──────────────────────────────────────────────────────────────────────
-
 def pretrain(
     demos: list[dict],
     model_type: str = "lstm",
@@ -604,7 +575,6 @@ def pretrain(
     print(f"[Pretrain] {len(demos)} demos, {epochs} epochs, tbtt={tbtt_length}, "
           f"traj_batch={traj_batch_size}, lr={lr}")
 
-    # ── Build model ──────────────────────────────────────────────────
     if model_type == "lstm":
         model = DiffusionLSTM(
                     state_dim=STATE_DIM,
@@ -641,13 +611,11 @@ def pretrain(
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    # Register dispersive hooks on the denoising MLP (last block)
     model.denoise_net.register_dispersive_hooks("late")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
 
-    # ── Build trajectory tensors for TBTT ────────────────────────────
     from collections import defaultdict
     traj_dict = defaultdict(list)
     for d in demos:
@@ -671,7 +639,6 @@ def pretrain(
     print(f"[Pretrain] {num_trajs} trajectories, {total_steps} total steps, "
           f"tbtt={tbtt_length}, traj_batch={traj_batch_size}")
 
-    # ── Training with TBTT ───────────────────────────────────────────
     os.makedirs(save_dir, exist_ok=True)
     best_loss = float("inf")
     torch.backends.cudnn.benchmark = True
@@ -691,7 +658,6 @@ def pretrain(
             batch_trajs = [traj_data[i] for i in tb_indices]
             T = min(t[0].shape[0] for t in batch_trajs)
 
-            # Stack trajectories into time-first layout: (T, B, ...)
             scans_tb  = torch.stack([sc[:T] for sc, _, _, _ in batch_trajs], dim=1)
             states_tb = torch.stack([st[:T] for _, st, _, _ in batch_trajs], dim=1)
             actions_tb = torch.stack([ac[:T] for _, _, ac, _ in batch_trajs], dim=1)
@@ -699,18 +665,15 @@ def pretrain(
 
             effective_tbtt = min(tbtt_length, T)
 
-            # Initialise temporal state for this trajectory batch
             if model_type == "lstm":
                 hidden_h, hidden_c = model.get_init_hidden(B, device, transpose=True)
                 obs_buffer = model.create_observation_buffer(B, device)
             else:
                 conv_state, ssm_state = model.allocate_state(B, device)
 
-            # TBTT: process in chunks, detaching hidden state at boundaries
             for chunk_start in range(0, T, effective_tbtt):
                 chunk_end = min(chunk_start + effective_tbtt, T)
 
-                # Truncate backprop by detaching carried state
                 if model_type == "lstm":
                     hidden_h = hidden_h.detach()
                     hidden_c = hidden_c.detach()
@@ -724,8 +687,7 @@ def pretrain(
                 chunk_len = chunk_end - chunk_start
 
                 for t in range(chunk_start, chunk_end):
-                    # Reset temporal state for trajectories that
-                    # had a done at the previous step.
+                    # Reset trajectories that ended at the previous step.
                     if t > 0 and dones_tb[t - 1].any():
                         reset_idx = dones_tb[t - 1].nonzero(
                             as_tuple=False).squeeze(-1)
@@ -822,16 +784,11 @@ def pretrain(
         if epoch % 25 == 0:
             torch.save(model.state_dict(), os.path.join(save_dir, f"actor_epoch_{epoch}.pt"))
 
-    # Final save
     torch.save(model.state_dict(), os.path.join(save_dir, "actor_final.pt"))
     print(f"\n[Pretrain] Done.  Best total loss: {best_loss:.5f}")
     print(f"  Saved to {os.path.join(save_dir, save_name)}")
     return model
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Critic pre-training  (uses same demos, proxy reward → MC returns)
-# ──────────────────────────────────────────────────────────────────────
 
 def pretrain_critic(
     demos: list[dict],
@@ -878,9 +835,7 @@ def pretrain_critic(
     if not has_reward_fields:
         print("  ⚠ Demos lack next_velocity/next_collision — using state vel_x proxy.")
 
-    # ── 1. Build CriticNetwork with pretrained vision encoder ────────
     encoder = VisionEncoder(num_scan_beams=NUM_BEAMS)
-    # Transfer actor CNN weights to critic encoder
     prefixes = ["conv_layers.", "vision_encoder.",
                 "0.module.conv_layers.", "0.module.vision_encoder."]
     encoder_sd = {}
@@ -925,19 +880,15 @@ def pretrain_critic(
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    # Freeze vision encoder (already pretrained)
     for p in critic.conv_layers.parameters():
         p.requires_grad = False
 
-    # ── 2. Reconstruct trajectories & compute MC returns ─────────────
-    # Group demos by (map, agent) to get per-agent time-ordered sequences.
     from collections import defaultdict
     trajectories = defaultdict(list)
     for d in demos:
         key = (d["map"], d.get("agent", 0))
         trajectories[key].append(d)
 
-    # Sort each trajectory by step index
     for key in trajectories:
         trajectories[key].sort(key=lambda x: x.get("step", 0))
 
@@ -952,7 +903,6 @@ def pretrain_critic(
         states = torch.stack([torch.from_numpy(d["state"]) for d in traj]).to(device)
         dones  = torch.tensor([d.get("done", 0) for d in traj], dtype=torch.float32, device=device)
 
-        # Compute per-step rewards
         rewards = torch.zeros(T)
         for t, d in enumerate(traj):
             if has_reward_fields:
@@ -963,12 +913,10 @@ def pretrain_critic(
                 col = 0
             rewards[t] = vel * speed_reward_scale + col * collision_penalty
 
-        # Normalise rewards per trajectory (zero-mean unit-variance)
         r_mean = rewards.mean()
         r_std = rewards.std().clamp(min=1e-4)
         rewards = (rewards - r_mean) / r_std
 
-        # MC returns (reverse cumsum), reset at episode boundaries
         returns = torch.zeros(T)
         G = 0.0
         for t in reversed(range(T)):
@@ -982,7 +930,6 @@ def pretrain_critic(
     print(f"  {num_trajs_c} trajectories, {total_steps_c} steps, "
           f"tbtt={tbtt_length}, traj_batch={traj_batch_size}")
 
-    # ── 3. TBTT training ────────────────────────────────────────────
     critic.train()
     optim_c = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, critic.parameters()),
@@ -1003,7 +950,6 @@ def pretrain_critic(
             batch_trajs = [traj_data_c[i] for i in tb_indices]
             T = min(t[0].shape[0] for t in batch_trajs)
 
-            # Stack into time-first layout
             scans_tb   = torch.stack([sc[:T] for sc, _, _, _ in batch_trajs], dim=1)
             states_tb  = torch.stack([st[:T] for _, st, _, _ in batch_trajs], dim=1)
             returns_tb = torch.stack([ret[:T] for _, _, ret, _ in batch_trajs], dim=1)
@@ -1011,14 +957,12 @@ def pretrain_critic(
 
             effective_tbtt = min(tbtt_length, T)
 
-            # Initialise temporal state
             if model_type == "lstm":
                 hidden_h, hidden_c = critic.get_init_hidden(B, device, transpose=True)
                 obs_buffer = critic.create_observation_buffer(B, device)
             else:
                 conv_state, ssm_state = critic.allocate_state(B, device)
 
-            # Process in TBTT chunks
             for chunk_start in range(0, T, effective_tbtt):
                 chunk_end = min(chunk_start + effective_tbtt, T)
 
@@ -1089,11 +1033,6 @@ def pretrain_critic(
     print("=" * 60 + "\n")
     return critic
 
-
-# ──────────────────────────────────────────────────────────────────────
-# CLI entry point
-# ──────────────────────────────────────────────────────────────────────
-
 def main():
     ALL_MAPS = [
         "Hockenheim", "Monza", "Melbourne", "BrandsHatch",
@@ -1110,7 +1049,6 @@ def main():
     ]
 
     parser = argparse.ArgumentParser(description="D²PPO Stage 1: BC Pre-training from MPC")
-    # Demo collection
     parser.add_argument("--maps", nargs="+", default=ALL_MAPS,
                         help="Maps to collect demos on (default: all)")
     parser.add_argument("--completable_only", action="store_true",
@@ -1129,7 +1067,6 @@ def main():
     parser.add_argument("--pretrained_expert", type=str, default="../racing_rl/actor_val_best.pt",
                         help="Path to pretrained model (.pt) from racing_rl to use as expert "
                              "(default: None, uses MPC as expert)")
-    # Actor training
     parser.add_argument("--model_type", type=str, default="mamba2", choices=["lstm", "mamba2"],
                         help="Network architecture backbone (lstm or mamba2)")
     parser.add_argument("--epochs", type=int, default=300)
@@ -1141,10 +1078,8 @@ def main():
     parser.add_argument("--dispersive_lambda", type=float, default=0.5)
     parser.add_argument("--num_diffusion_steps", type=int, default=100)
     parser.add_argument("--gradient_accumulation", type=int, default=1)
-    # Actor output
     parser.add_argument("--save_dir", type=str, default="models/actor/pretrained")
     parser.add_argument("--save_name", type=str, default="actor_pretrained.pt")
-    # Critic pretraining
     parser.add_argument("--critic_epochs", type=int, default=30)
     parser.add_argument("--critic_lr", type=float, default=1e-4)
     parser.add_argument("--critic_save_dir", type=str, default="models/critic/pretrained")
@@ -1158,13 +1093,11 @@ def main():
         args.maps = COMPLETABLE_MAPS
         print(f"[Main] --completable_only: restricting to {args.maps}")
 
-    # ── Collect or load demonstrations ───────────────────────────────
     if args.load and os.path.exists(args.load):
         print(f"[Main] Loading demos from {args.load}")
         demos = torch.load(args.load, weights_only=False)
         print(f"[Main] Loaded {len(demos)} demos")
     elif args.pretrained_expert:
-        # Use pretrained model from racing_rl as expert
         print(f"[Main] Using pretrained expert: {args.pretrained_expert}")
         demos = collect_demos_pretrained(
             maps=args.maps,
@@ -1172,24 +1105,20 @@ def main():
             num_agents=args.num_agents,
             steps_per_map=args.steps_per_map,
         )
-        # Save demos for reuse
         os.makedirs(os.path.dirname(args.save_demos) or ".", exist_ok=True)
         torch.save(demos, args.save_demos)
         print(f"[Main] Demos saved to {args.save_demos}")
     else:
-        # Use MPC as expert (default)
         demos = collect_demos(
             maps=args.maps,
             num_agents=args.num_agents,
             steps_per_map=args.steps_per_map,
             max_workers=args.max_workers,
         )
-        # Save demos for reuse
         os.makedirs(os.path.dirname(args.save_demos) or ".", exist_ok=True)
         torch.save(demos, args.save_demos)
         print(f"[Main] Demos saved to {args.save_demos}")
 
-    # ── Train actor ──────────────────────────────────────────────────
     model = pretrain(
         demos=demos,
         model_type=args.model_type,
@@ -1204,12 +1133,10 @@ def main():
         save_name=args.save_name,
     )
 
-    # ── Quick validation: sample actions with temporal context ────────
     print("\n[Validation] Sampling actions from pretrained model (with temporal context) …")
     model.eval()
     device = next(model.parameters()).device
     with torch.no_grad():
-        # Build a trajectory from the first map/agent in the demos
         from collections import defaultdict
         val_traj_dict = defaultdict(list)
         for d in demos:
@@ -1228,7 +1155,6 @@ def main():
         else:
             conv_state, ssm_state = model.allocate_state(1, device)
 
-        # Warm up temporal state with sequential observations
         for t in range(warmup):
             if args.model_type == "lstm":
                 obs_feat, obs_buffer, hidden_h, hidden_c = model.encode_observation(
@@ -1237,7 +1163,6 @@ def main():
                 obs_feat, conv_state, ssm_state = model.encode_observation(
                     val_scans[t:t+1], val_states[t:t+1], conv_state, ssm_state)
 
-        # Now evaluate on the next 8 steps with valid temporal context
         eval_start = warmup
         eval_end = min(eval_start + 8, T_val)
         sampled_list = []
@@ -1263,7 +1188,6 @@ def main():
         speed_mse = F.mse_loss(sampled[:, 1], expert[:, 1]).item()
         print(f"  Action MSE: {mse:.4f}  (steering: {steer_mse:.4f}, speed: {speed_mse:.4f})")
 
-    # ── Train critic (reuse same demos) ──────────────────────────────
     actor_weights_path = os.path.join(args.save_dir, args.save_name)
     if not args.skip_critic:
         actor_sd = torch.load(actor_weights_path, weights_only=False)

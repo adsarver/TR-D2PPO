@@ -15,18 +15,10 @@ import torch
 import gym
 
 from D2PPO_agent import D2PPOAgent as PPOAgent
+from utils.sim_config import LIDAR_BEAMS, LIDAR_FOV, SIM_PARAMS
 from utils.utils import get_map_dir, generate_start_poses
 
-PARAMS_DICT = {
-    "mu": 1.0489, "C_Sf": 4.718, "C_Sr": 5.4562,
-    "lf": 0.15875, "lr": 0.17145, "h": 0.074, "m": 3.74,
-    "I": 0.04712, "s_min": -0.34, "s_max": 0.34,
-    "sv_min": -3.2, "sv_max": 3.2, "v_switch": 7.319,
-    "a_max": 9.51, "v_min": -5.0, "v_max": 20.0,
-    "width": 0.31, "length": 0.58,
-}
-LIDAR_BEAMS = 1080
-LIDAR_FOV = 4.7
+PARAMS_DICT = SIM_PARAMS.copy()
 LAP_TIMEOUT = 180.0       # seconds
 COLLISION_TIMEOUT = 0.5
 
