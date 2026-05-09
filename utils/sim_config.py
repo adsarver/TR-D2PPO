@@ -15,8 +15,8 @@ SIM_PARAMS = {
     "a_max": 9.51,
     "v_min": -5.0,
     "v_max": 20.0,
-    "width": 0.31,
-    "length": 0.58,
+    "width": 0.279,
+    "length": 0.533,
 }
 
 LIDAR_BEAMS = 1080

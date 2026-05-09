@@ -23,10 +23,32 @@ except ImportError:
     )
 
 
-RACE_DATA_PATH = 'analysis/analysis/race_data_CS677.pkl'
-OVERTAKE_DATA_PATH = 'analysis/race_data_OVERTAKE.pkl'
+RACE_DATA_PATH = 'analysis/analysis/race_data_CS677_no_opp.pkl'
+OVERTAKE_DATA_PATH = 'analysis/analysis/race_data_CS677_opp.pkl'
 COMBINED_MAPS = os.listdir("maps")
-EXPECTED_LAPS = 3
+EXPECTED_LAPS = 10
+
+
+def _lap_progress_total(laps, expected_laps=EXPECTED_LAPS):
+    progress = sum(np.clip(lap.get('Progress', 1.0), 0.0, 1.0) for lap in laps)
+    return min(progress, float(expected_laps))
+
+
+def _completion_percent(laps, expected_laps=EXPECTED_LAPS):
+    if expected_laps <= 0:
+        return 0.0
+    return _lap_progress_total(laps, expected_laps) / expected_laps * 100.0
+
+
+def _completed_lap_count(laps):
+    n_completed = 0
+    for lap in laps:
+        try:
+            float(lap['Time'])
+            n_completed += 1
+        except (KeyError, TypeError, ValueError):
+            pass
+    return n_completed
 
 
 def create_lap_comparison(race_data):
@@ -341,7 +363,7 @@ def plot_lap_stats_table(d):
     import matplotlib.pyplot as plt
     import os
 
-    TARGET_LAPS = 10  # K for CR@K
+    cr_k = EXPECTED_LAPS
 
     for map_name, agents in d.items():
         map_dir = f"analysis/map_results/{map_name}"
@@ -376,8 +398,6 @@ def plot_lap_stats_table(d):
                     prog_at_fail,
                 ])
 
-        n_all_laps = max(len(agents[a]['laps']) for a in agent_names) if agent_names else 0
-        cr_k = n_all_laps if n_all_laps > 0 else TARGET_LAPS
         summary_cols = ['Agent', f'CR@{cr_k}', 'Lap Time (s)',
                         'Max Speed (m/s)', 'Collisions / Lap', 'CSS (↓)',
                         '% Completed (total)', 'Progress @ Failure']
@@ -419,9 +439,8 @@ def plot_lap_stats_table(d):
             mean_css = np.mean(css_vals) if css_vals else 0.0
             css_str = f"{mean_css:.4f}"
 
-            # % completed: sum lap progress / 3, scaled to 0-100%
-            prog_vals_all = [lap.get('Progress', 1.0) for lap in laps]
-            pct = np.sum(prog_vals_all) / 3.0 * 100.0 if prog_vals_all else 0.0
+            # % completed: sum lap progress / EXPECTED_LAPS, capped at 100%.
+            pct = _completion_percent(laps)
             pct_str = f"{pct:.1f}%"
 
             # Progress before failure (DNF laps only)
@@ -472,8 +491,6 @@ def plot_combined_lap_stats(d, map_list):
     import matplotlib.pyplot as plt
     import os
 
-    TARGET_LAPS = 10
-
     active_maps = [m for m in map_list if m in d]
     if not active_maps:
         print("  [combined] No matching maps found – skipping.")
@@ -516,9 +533,7 @@ def plot_combined_lap_stats(d, map_list):
                     prog_at_fail,
                 ])
 
-    total_lap_counts = [len(agent_laps[a]) for a in all_agents]
-    n_all_laps = max(total_lap_counts) if total_lap_counts else 0
-    cr_k = n_all_laps if n_all_laps > 0 else TARGET_LAPS
+    cr_k = EXPECTED_LAPS
     summary_cols = ['Agent', 'Maps', 'Total Laps', f'CR@{cr_k}',
                     'Lap Time (s)', 'Max Speed (m/s)',
                     'Collisions / Lap', 'CSS (↓)',
@@ -538,7 +553,15 @@ def plot_combined_lap_stats(d, map_list):
                 pass
         n_completed = len(valid_times)
 
-        cr_at_k = '1' if n_completed >= cr_k else '0'
+        completed_maps = 0
+        evaluated_maps = 0
+        for m in active_maps:
+            if agent_name not in d[m]:
+                continue
+            evaluated_maps += 1
+            if _completed_lap_count(d[m][agent_name]['laps']) >= cr_k:
+                completed_maps += 1
+        cr_at_k = f"{completed_maps / evaluated_maps * 100.0:.1f}%" if evaluated_maps else '0.0%'
 
         # Lap time: compute per-map mean, then average those means (± std across maps)
         per_map_mean_times = []
@@ -577,14 +600,13 @@ def plot_combined_lap_stats(d, map_list):
         mean_css = np.mean(per_map_css) if per_map_css else 0.0
         css_str = f"{mean_css:.4f}"
 
-        # Per-map: sum lap progress / 3, then average across maps
+        # Per-map: sum lap progress / EXPECTED_LAPS, then average across maps.
         per_map_pcts = []
         for m in active_maps:
             if agent_name not in d[m]:
                 continue
             map_laps = d[m][agent_name]['laps']
-            map_prog = sum(lap.get('Progress', 1.0) for lap in map_laps)
-            per_map_pcts.append(map_prog / 3.0 * 100.0)
+            per_map_pcts.append(_completion_percent(map_laps))
         pct = np.mean(per_map_pcts) if per_map_pcts else 0.0
         pct_str = f"{pct:.1f}%"
 
@@ -799,6 +821,128 @@ def plot_lap_time_distribution(d):
         print(f"  Saved {map_dir}/lap_time_distribution.png")
 
 
+def plot_lap_time_by_lap(d):
+    """Per-map line plot of lap time versus lap number for all agents.
+
+    Completed laps are plotted as connected points. DNF laps are shown with
+    an x-marker near the top of the axis so failed attempts remain visible
+    without being treated as real lap-time values.
+    """
+    import matplotlib.pyplot as plt
+    import os
+
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+    for map_name, agents in d.items():
+        map_dir = f"analysis/map_results/{map_name}"
+        os.makedirs(map_dir, exist_ok=True)
+
+        agent_names = sorted(agents.keys())
+        series = {}
+        completed_times_all = []
+        max_laps = 0
+
+        for agent_name in agent_names:
+            laps = agents[agent_name]['laps']
+            max_laps = max(max_laps, len(laps))
+
+            completed_x = []
+            completed_y = []
+            dnf_x = []
+            for lap_idx, lap in enumerate(laps, start=1):
+                try:
+                    lap_time = float(lap['Time'])
+                except (KeyError, TypeError, ValueError):
+                    dnf_x.append(lap_idx)
+                    continue
+                completed_x.append(lap_idx)
+                completed_y.append(lap_time)
+                completed_times_all.append(lap_time)
+
+            series[agent_name] = {
+                'completed_x': completed_x,
+                'completed_y': completed_y,
+                'dnf_x': dnf_x,
+                'n_laps': len(laps),
+            }
+
+        if max_laps == 0:
+            continue
+
+        if completed_times_all:
+            y_min = min(completed_times_all)
+            y_max = max(completed_times_all)
+            y_range = max(y_max - y_min, 1.0)
+            dnf_y = y_max + 0.08 * y_range
+            ylim_top = y_max + 0.18 * y_range
+            ylim_bottom = max(0.0, y_min - 0.10 * y_range)
+        else:
+            dnf_y = 1.0
+            ylim_bottom = 0.0
+            ylim_top = 1.2
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.55 * max_laps), 5))
+
+        for idx, agent_name in enumerate(agent_names):
+            color = color_cycle[idx % len(color_cycle)]
+            data = series[agent_name]
+            label = f"{agent_name} ({data['n_laps']}/{EXPECTED_LAPS} laps)"
+
+            if data['completed_x']:
+                ax.plot(
+                    data['completed_x'],
+                    data['completed_y'],
+                    marker='o',
+                    markersize=4,
+                    linewidth=1.5,
+                    color=color,
+                    label=label,
+                )
+            else:
+                ax.plot([], [], marker='o', linewidth=1.5,
+                        color=color, label=label)
+
+            if data['dnf_x']:
+                ax.scatter(
+                    data['dnf_x'],
+                    np.full(len(data['dnf_x']), dnf_y),
+                    marker='x',
+                    s=50,
+                    linewidths=1.5,
+                    color=color,
+                    zorder=5,
+                )
+
+        if any(series[a]['dnf_x'] for a in agent_names):
+            ax.axhline(dnf_y, color='black', linewidth=0.6,
+                       linestyle='--', alpha=0.35)
+            ax.text(
+                0.01,
+                dnf_y,
+                'DNF',
+                transform=ax.get_yaxis_transform(),
+                ha='left',
+                va='bottom',
+                fontsize=9,
+                color='black',
+            )
+
+        ax.set_xlim(0.5, max_laps + 0.5)
+        ax.set_ylim(ylim_bottom, ylim_top)
+        ax.set_xticks(range(1, max_laps + 1))
+        ax.set_xlabel('Lap Number', fontsize=11)
+        ax.set_ylabel('Lap Time (s)', fontsize=11)
+        ax.set_title(f'Lap Time over Lap Number — {map_name}',
+                     fontsize=13, fontweight='bold')
+        ax.grid(True, linewidth=0.35, alpha=0.5)
+        ax.legend(fontsize=9, loc='best')
+        fig.tight_layout()
+        fig.savefig(f"{map_dir}/lap_time_by_lap.png",
+                    dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"  Saved {map_dir}/lap_time_by_lap.png")
+
+
 def load_overtake_data():
     try:
         data = load_race_data(
@@ -806,6 +950,7 @@ def load_overtake_data():
             agent_renames={'SupervisedAgent': 'TR Agent'},
         )
     except FileNotFoundError:
+        print(f"  Overtake data file not found at {OVERTAKE_DATA_PATH} – skipping interaction metrics.")
         return {}
     data.pop('PurePursuit', None)
     return data
@@ -814,6 +959,7 @@ def load_overtake_data():
 def plot_interaction_metrics(data):
     """Save per-map and aggregate overtaking interaction tables."""
     if not data:
+        print("  No overtake data found – skipping interaction metrics.")
         return
     import matplotlib.pyplot as plt
     import os
@@ -1046,6 +1192,7 @@ def plot_overtake_time_series(data):
     over time.  Illustrates safe interaction during dense-traffic overtaking.
     """
     if not data:
+        print("  No overtake data found – skipping interaction metrics.")
         return
     import matplotlib.pyplot as plt
     import os
@@ -1137,20 +1284,830 @@ def plot_overtake_time_series(data):
             print(f'  Saved {out_dir}/overtake_timeseries_{safe}.png')
 
 
+def plot_overtake_snapshots(data, target_agent=None,
+                            lookback=120, lookahead=90,
+                            zoom_radius=4.0, n_overtakes_max=3):
+    """
+    Render 4-phase bird's-eye snapshots of overtaking events.
+
+    This follows the previous BC-LSTM paper visualization style. Each detected
+    close-pass event is shown as Approaching, Getting Beside, Alongside, and
+    Past. For multi-opponent traffic runs, the closest opponent at the event
+    center is selected and tracked across the four panels.
+    """
+    if not data:
+        print("  No overtake data found - skipping overtake snapshots.")
+        return
+    if target_agent is not None and target_agent not in data:
+        print(f"  [overtake_snapshots] No data for '{target_agent}' - skipping.")
+        return
+
+    import glob
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import matplotlib.patheffects as patheffects
+    import os
+    import yaml
+    from PIL import Image
+
+    try:
+        from scipy.signal import argrelextrema
+    except Exception:
+        argrelextrema = None
+
+    DT = 0.01
+    PROXIMITY_THRESH = 5.0
+    MIN_EVENT_SEP = int(4.0 / DT)
+    WARMUP_SKIP = 0
+
+    NEAR_THRESH = 0.5
+    FAR_THRESH = 1.0
+    PHASE_LABELS = ['Approaching', 'Getting Beside', 'Alongside', 'Past']
+
+    def _local_minima(values, order):
+        if argrelextrema is not None:
+            return argrelextrema(values, np.less_equal, order=order)[0]
+        minima = []
+        for idx in range(order, len(values) - order):
+            window = values[idx - order:idx + order + 1]
+            if values[idx] <= np.min(window):
+                minima.append(idx)
+        return np.array(minima, dtype=int)
+
+    def _load_raceline(map_name):
+        try:
+            paths = glob.glob(f'maps/{map_name}/*_raceline.csv')
+            if not paths:
+                return None
+            raw = np.genfromtxt(paths[0], delimiter=';', comments='#')
+            if raw.ndim != 2 or raw.shape[1] < 3:
+                return None
+            return raw[:, 1:3]
+        except Exception:
+            return None
+
+    def _load_map_image(map_name):
+        try:
+            image_path = f"maps/{map_name}/{map_name}_map.png"
+            if not os.path.exists(image_path):
+                candidates = glob.glob(f"maps/{map_name}/*_map.png")
+                if not candidates:
+                    return None
+                image_path = candidates[0]
+            yaml_path = image_path.replace('_map.png', '_map.yaml')
+            if not os.path.exists(yaml_path):
+                candidates = glob.glob(f"maps/{map_name}/*_map.yaml")
+                if not candidates:
+                    return None
+                yaml_path = candidates[0]
+
+            image = Image.open(image_path)
+            image_arr = np.array(image)
+            with open(yaml_path, 'r') as file:
+                map_yaml = yaml.safe_load(file)
+            origin = map_yaml['origin']
+            resolution = map_yaml['resolution']
+            img_width, img_height = image.size
+            return {
+                'image': image_arr,
+                'x_min': origin[0],
+                'y_min': origin[1],
+                'x_max': origin[0] + img_width * resolution,
+                'y_max': origin[1] + img_height * resolution,
+            }
+        except Exception as exc:
+            print(f"  [overtake_snapshots] {map_name}: could not load map image ({exc})")
+            return None
+
+    agents_to_plot = [target_agent] if target_agent is not None else sorted(data.keys())
+    for agent in agents_to_plot:
+        for map_name, obss in data.get(agent, {}).items():
+            if not obss:
+                continue
+            ego = obss[0].get('ego_idx', 0)
+            n_cars = len(obss[0]['poses_x'])
+            if n_cars <= 1:
+                continue
+
+            n_obs = len(obss)
+            all_px = np.array([o['poses_x'] for o in obss])
+            all_py = np.array([o['poses_y'] for o in obss])
+            ego_xy = np.stack([all_px[:, ego], all_py[:, ego]], axis=1)
+
+            opponent_indices = [idx for idx in range(n_cars) if idx != ego]
+            opponent_distances = []
+            for opp_idx in opponent_indices:
+                opp_xy = np.stack([all_px[:, opp_idx], all_py[:, opp_idx]], axis=1)
+                opponent_distances.append(np.sqrt(((ego_xy - opp_xy)**2).sum(axis=1)))
+            opponent_distances = np.stack(opponent_distances, axis=1)
+            d_min_t = np.min(opponent_distances, axis=1)
+            closest_opp_t = np.argmin(opponent_distances, axis=1)
+
+            kernel = int(0.5 / DT)
+            if kernel > 1:
+                d_smooth = np.convolve(d_min_t, np.ones(kernel) / kernel, mode='same')
+            else:
+                d_smooth = d_min_t
+
+            order = max(1, int(1.0 / DT))
+            local_min_idx = _local_minima(d_smooth, order)
+            close_events = [int(idx) for idx in local_min_idx
+                            if d_min_t[idx] < PROXIMITY_THRESH and idx >= WARMUP_SKIP]
+
+            if not close_events:
+                print(f"  [overtake_snapshots] {agent}/{map_name}: no close-proximity events found - skipping.")
+                continue
+
+            deduped = [close_events[0]]
+            for step in close_events[1:]:
+                if step - deduped[-1] > MIN_EVENT_SEP:
+                    deduped.append(step)
+                elif d_min_t[step] < d_min_t[deduped[-1]]:
+                    deduped[-1] = step
+
+            deduped.sort(key=lambda idx: d_min_t[idx])
+            event_centers = sorted(deduped[:n_overtakes_max])
+
+            event_rows = []
+            for center in event_centers:
+                opp_col = int(closest_opp_t[center])
+                opp_idx = opponent_indices[opp_col]
+                distances_to_opp = opponent_distances[:, opp_col]
+
+                window_thresh = max(PROXIMITY_THRESH, FAR_THRESH * 3.0)
+                win_start = center
+                while win_start > 0 and distances_to_opp[win_start - 1] < window_thresh:
+                    win_start -= 1
+                win_end = center
+                while win_end < n_obs - 1 and distances_to_opp[win_end + 1] < window_thresh:
+                    win_end += 1
+
+                min_half = int(0.3 / DT)
+                win_start = min(win_start, max(0, center - min_half))
+                win_end = max(win_end, min(n_obs - 1, center + min_half))
+
+                total = win_end - win_start
+                phase_steps = [
+                    win_start,
+                    win_start + total // 3,
+                    center,
+                    min(win_end, n_obs - 1),
+                ]
+                for phase_idx in range(1, 4):
+                    if phase_steps[phase_idx] <= phase_steps[phase_idx - 1]:
+                        phase_steps[phase_idx] = min(
+                            phase_steps[phase_idx - 1] + max(1, int(0.1 / DT)),
+                            n_obs - 1,
+                        )
+                event_rows.append({
+                    'opp_idx': opp_idx,
+                    'opp_col': opp_col,
+                    'steps': phase_steps,
+                })
+
+            map_image = _load_map_image(map_name)
+            if map_image is None:
+                print(f"  [overtake_snapshots] {agent}/{map_name}: map image unavailable - skipping.")
+                continue
+            raceline_xy = _load_raceline(map_name)
+
+            out_dir = f"analysis/map_results/{map_name}"
+            os.makedirs(out_dir, exist_ok=True)
+
+            n_events = len(event_rows)
+            fig, axes = plt.subplots(
+                n_events,
+                4,
+                figsize=(5.5 * 4, 5.0 * n_events),
+                squeeze=False,
+            )
+
+            for row_idx, event in enumerate(event_rows):
+                opp_idx = event['opp_idx']
+                opp_col = event['opp_col']
+                for col_idx, step in enumerate(event['steps']):
+                    ax = axes[row_idx][col_idx]
+
+                    ego_x = all_px[step, ego]
+                    ego_y = all_py[step, ego]
+                    opp_x = all_px[step, opp_idx]
+                    opp_y = all_py[step, opp_idx]
+                    cx = opp_x
+                    cy = opp_y
+
+                    sep = np.sqrt((ego_x - opp_x)**2 + (ego_y - opp_y)**2)
+                    view_radius = max(zoom_radius, sep + 1.0)
+
+                    ax.imshow(
+                        map_image['image'],
+                        extent=[map_image['x_min'], map_image['x_max'],
+                                map_image['y_min'], map_image['y_max']],
+                        aspect='equal',
+                        cmap='gray',
+                        origin='upper',
+                        zorder=0,
+                    )
+
+                    if raceline_xy is not None:
+                        ax.plot(
+                            raceline_xy[:, 0], raceline_xy[:, 1],
+                            color='#AB47BC', linewidth=1.4, alpha=0.55,
+                            linestyle='-', zorder=1,
+                            label='Raceline' if row_idx == 0 and col_idx == 0 else None,
+                        )
+
+                    bar_len = 1.0
+                    bar_x0 = cx - view_radius + 0.15 * view_radius
+                    bar_y0 = cy - view_radius + 0.12 * view_radius
+                    ax.plot([bar_x0, bar_x0 + bar_len], [bar_y0, bar_y0],
+                            color='white', linewidth=2.5,
+                            solid_capstyle='butt', zorder=15)
+                    ax.text(
+                        bar_x0 + bar_len / 2,
+                        bar_y0 + 0.08 * view_radius,
+                        f'{bar_len:.0f} m',
+                        color='white', fontsize=12, ha='center', va='bottom',
+                        fontweight='bold', zorder=15,
+                        path_effects=[patheffects.withStroke(linewidth=2, foreground='black')],
+                    )
+
+                    far_circle = mpatches.Circle(
+                        (opp_x, opp_y), radius=FAR_THRESH,
+                        fill=True, facecolor='#FFF3E0', alpha=0.35,
+                        edgecolor='#FF9800', linewidth=2.5,
+                        linestyle='--', zorder=8,
+                    )
+                    ax.add_patch(far_circle)
+                    near_circle = mpatches.Circle(
+                        (opp_x, opp_y), radius=NEAR_THRESH,
+                        fill=True, facecolor='#FFCDD2', alpha=0.45,
+                        edgecolor='#D32F2F', linewidth=2.5,
+                        linestyle='-', zorder=9,
+                    )
+                    ax.add_patch(near_circle)
+
+                    t0 = max(0, step - lookback)
+                    ax.plot(
+                        all_px[t0:step + 1, ego], all_py[t0:step + 1, ego],
+                        color='#2196F3', linewidth=1.8,
+                        linestyle='--', alpha=0.75, zorder=10,
+                        label='Ego past' if row_idx == 0 and col_idx == 0 else None,
+                    )
+
+                    t1 = min(n_obs, step + lookahead)
+                    future_x = all_px[step:t1, ego]
+                    future_y = all_py[step:t1, ego]
+                    ax.plot(
+                        future_x, future_y, color='#4CAF50', linewidth=2.5,
+                        alpha=0.9, zorder=11,
+                        label='Ego future' if row_idx == 0 and col_idx == 0 else None,
+                    )
+                    if len(future_x) > 2:
+                        ax.annotate(
+                            '', xy=(future_x[-1], future_y[-1]),
+                            xytext=(future_x[0], future_y[0]),
+                            arrowprops=dict(
+                                arrowstyle='-|>', color='#4CAF50', lw=2.6,
+                                mutation_scale=18, shrinkA=0, shrinkB=0,
+                            ),
+                            zorder=12,
+                        )
+
+                    for other_idx in opponent_indices:
+                        if other_idx == opp_idx:
+                            continue
+                        ax.plot(
+                            all_px[step, other_idx], all_py[step, other_idx],
+                            's', color='#9E9E9E', markersize=5,
+                            markeredgecolor='black', markeredgewidth=0.6,
+                            alpha=0.65, zorder=7,
+                            label='Other traffic' if row_idx == 0 and col_idx == 0 and other_idx == opponent_indices[0] else None,
+                        )
+
+                    ax.plot(
+                        ego_x, ego_y, 'o', color='#FF9800', markersize=8,
+                        markeredgecolor='black', markeredgewidth=1.2,
+                        zorder=13,
+                        label=f'Ego ({agent})' if row_idx == 0 and col_idx == 0 else None,
+                    )
+                    ax.plot(
+                        opp_x, opp_y, 's', color='#E53935', markersize=7,
+                        markeredgecolor='black', markeredgewidth=1.0,
+                        zorder=12,
+                        label='Opponent' if row_idx == 0 and col_idx == 0 else None,
+                    )
+
+                    if row_idx == 0 and col_idx == 0:
+                        ax.plot([], [], color='#D32F2F', linewidth=2.5,
+                                linestyle='-', label=f'Avoidance zone ({NEAR_THRESH}m)')
+                        ax.plot([], [], color='#FF9800', linewidth=2.5,
+                                linestyle='--', label=f'Transition zone ({FAR_THRESH}m)')
+
+                    ax.set_xlim(cx - view_radius, cx + view_radius)
+                    ax.set_ylim(cy - view_radius, cy + view_radius)
+                    ax.set_aspect('equal')
+                    distance_at_step = opponent_distances[step, opp_col]
+                    ax.set_title(
+                        f"{PHASE_LABELS[col_idx]}\nt = {step * DT:.2f}s   d = {distance_at_step:.2f}m",
+                        fontsize=14,
+                        fontweight='bold',
+                    )
+                    ax.tick_params(labelsize=10)
+
+            axes[0][0].legend(fontsize=10, loc='upper left', framealpha=0.9,
+                              handlelength=1.5)
+
+            safe = safe_name(agent)
+            fig.suptitle(f"{agent} - Overtake Sequence - {map_name}",
+                         fontsize=20, fontweight='bold')
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+            fig.savefig(f"{out_dir}/overtake_snapshots_{safe}.png",
+                        dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close(fig)
+            print(f"  Saved {out_dir}/overtake_snapshots_{safe}.png")
+
+
+def plot_first_overtake_overlay_snapshots(data, agents=None,
+                                          lookback=120, lookahead=90,
+                                          zoom_radius=4.0):
+    """Overlay each agent's first detected pass on one 4-phase snapshot sheet.
+
+    Each map gets one comparison figure. For every selected ego policy, the
+    first close-proximity event that looks like a pass is chosen; if no clean
+    behind-to-ahead transition is detected, the earliest close pass is used as
+    a fallback so every available agent remains visible.
+    """
+    if not data:
+        print("  No overtake data found - skipping first-overtake overlays.")
+        return
+
+    import glob
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import matplotlib.patheffects as patheffects
+    import os
+    import yaml
+    from PIL import Image
+
+    try:
+        from scipy.signal import argrelextrema
+    except Exception:
+        argrelextrema = None
+
+    DT = 0.01
+    PROXIMITY_THRESH = 5.0
+    MIN_EVENT_SEP = int(4.0 / DT)
+    WARMUP_SKIP = 0
+    GAP_THRESH = 0.02
+
+    NEAR_THRESH = 0.5
+    FAR_THRESH = 1.0
+    PHASE_LABELS = ['Approaching', 'Getting Beside', 'Alongside', 'Past']
+    AGENT_COLORS = {
+        'BC_LSTM': '#1f77b4',
+        'D2PPO': '#d62728',
+        'GFPP': '#2ca02c',
+        'MPC': '#9467bd',
+        'TR Agent': '#ff7f0e',
+    }
+
+    def _local_minima(values, order):
+        if argrelextrema is not None:
+            return argrelextrema(values, np.less_equal, order=order)[0]
+        minima = []
+        for idx in range(order, len(values) - order):
+            window = values[idx - order:idx + order + 1]
+            if values[idx] <= np.min(window):
+                minima.append(idx)
+        return np.array(minima, dtype=int)
+
+    def _load_raceline(map_name):
+        try:
+            paths = glob.glob(f'maps/{map_name}/*_raceline.csv')
+            if not paths:
+                return None
+            raw = np.genfromtxt(paths[0], delimiter=';', comments='#')
+            if raw.ndim != 2 or raw.shape[1] < 3:
+                return None
+            return raw[:, 1:3]
+        except Exception:
+            return None
+
+    def _load_map_image(map_name):
+        try:
+            image_path = f"maps/{map_name}/{map_name}_map.png"
+            if not os.path.exists(image_path):
+                candidates = glob.glob(f"maps/{map_name}/*_map.png")
+                if not candidates:
+                    return None
+                image_path = candidates[0]
+            yaml_path = image_path.replace('_map.png', '_map.yaml')
+            if not os.path.exists(yaml_path):
+                candidates = glob.glob(f"maps/{map_name}/*_map.yaml")
+                if not candidates:
+                    return None
+                yaml_path = candidates[0]
+
+            image = Image.open(image_path)
+            image_arr = np.array(image)
+            with open(yaml_path, 'r') as file:
+                map_yaml = yaml.safe_load(file)
+            origin = map_yaml['origin']
+            resolution = map_yaml['resolution']
+            img_width, img_height = image.size
+            return {
+                'image': image_arr,
+                'x_min': origin[0],
+                'y_min': origin[1],
+                'x_max': origin[0] + img_width * resolution,
+                'y_max': origin[1] + img_height * resolution,
+            }
+        except Exception as exc:
+            print(f"  [first_overtake_overlay] {map_name}: could not load map image ({exc})")
+            return None
+
+    centerline_cache = {}
+
+    def _progress_at(map_name, obss, all_px, all_py, car_idx, step):
+        if map_name not in centerline_cache:
+            try:
+                centerline_cache[map_name] = load_centerline(map_name)
+            except Exception:
+                centerline_cache[map_name] = None
+        centerline = centerline_cache.get(map_name)
+        if centerline is None:
+            return None
+        cl_xy, cl_cum_s, lap_length = centerline
+        frac = project_progress((all_px[step, car_idx], all_py[step, car_idx]),
+                                cl_xy, cl_cum_s, lap_length)
+        if 'lap_counts' in obss[step]:
+            return float(obss[step]['lap_counts'][car_idx]) + frac
+        return frac
+
+    def _event_window(center, distances_to_opp, n_obs):
+        window_thresh = max(PROXIMITY_THRESH, FAR_THRESH * 3.0)
+        win_start = center
+        while win_start > 0 and distances_to_opp[win_start - 1] < window_thresh:
+            win_start -= 1
+        win_end = center
+        while win_end < n_obs - 1 and distances_to_opp[win_end + 1] < window_thresh:
+            win_end += 1
+
+        min_half = int(0.3 / DT)
+        win_start = min(win_start, max(0, center - min_half))
+        win_end = max(win_end, min(n_obs - 1, center + min_half))
+
+        total = win_end - win_start
+        phase_steps = [
+            win_start,
+            win_start + total // 3,
+            center,
+            min(win_end, n_obs - 1),
+        ]
+        for phase_idx in range(1, 4):
+            if phase_steps[phase_idx] <= phase_steps[phase_idx - 1]:
+                phase_steps[phase_idx] = min(
+                    phase_steps[phase_idx - 1] + max(1, int(0.1 / DT)),
+                    n_obs - 1,
+                )
+        return win_start, win_end, phase_steps
+
+    def _cumulative_progress_series(map_name, obss, all_px, all_py, car_idx):
+        if map_name not in centerline_cache:
+            try:
+                centerline_cache[map_name] = load_centerline(map_name)
+            except Exception:
+                centerline_cache[map_name] = None
+        centerline = centerline_cache.get(map_name)
+        if centerline is None:
+            return None
+
+        cl_xy, cl_cum_s, lap_length = centerline
+        progress = np.array([
+            project_progress((all_px[step, car_idx], all_py[step, car_idx]),
+                             cl_xy, cl_cum_s, lap_length)
+            for step in range(len(obss))
+        ])
+        if 'lap_counts' in obss[0]:
+            lap_counts = np.array([o['lap_counts'][car_idx] for o in obss], dtype=float)
+            return lap_counts + progress
+        return progress
+
+    def _make_record(agent, ego, opp_idx, opp_col, opponent_indices,
+                     opponent_distances, all_px, all_py, center, n_obs,
+                     is_pass):
+        distances_to_opp = opponent_distances[:, opp_col]
+        _, _, phase_steps = _event_window(center, distances_to_opp, n_obs)
+        return {
+            'agent': agent,
+            'ego': ego,
+            'opp_idx': opp_idx,
+            'opp_col': opp_col,
+            'opponent_indices': opponent_indices,
+            'opponent_distances': opponent_distances,
+            'all_px': all_px,
+            'all_py': all_py,
+            'steps': phase_steps,
+            'center': center,
+            'n_obs': n_obs,
+            'is_pass': is_pass,
+        }
+
+    def _first_overtake_event(agent, map_name, obss):
+        if not obss:
+            return None
+        ego = obss[0].get('ego_idx', 0)
+        n_cars = len(obss[0]['poses_x'])
+        if n_cars <= 1:
+            return None
+
+        n_obs = len(obss)
+        all_px = np.array([o['poses_x'] for o in obss])
+        all_py = np.array([o['poses_y'] for o in obss])
+        ego_xy = np.stack([all_px[:, ego], all_py[:, ego]], axis=1)
+
+        opponent_indices = [idx for idx in range(n_cars) if idx != ego]
+        opponent_distances = []
+        for opp_idx in opponent_indices:
+            opp_xy = np.stack([all_px[:, opp_idx], all_py[:, opp_idx]], axis=1)
+            opponent_distances.append(np.sqrt(((ego_xy - opp_xy)**2).sum(axis=1)))
+        opponent_distances = np.stack(opponent_distances, axis=1)
+        d_min_t = np.min(opponent_distances, axis=1)
+        closest_opp_t = np.argmin(opponent_distances, axis=1)
+
+        kernel = int(0.5 / DT)
+        if kernel > 1:
+            d_smooth = np.convolve(d_min_t, np.ones(kernel) / kernel, mode='same')
+        else:
+            d_smooth = d_min_t
+
+        order = max(1, int(1.0 / DT))
+        local_min_idx = _local_minima(d_smooth, order)
+        close_events = [int(idx) for idx in local_min_idx
+                        if d_min_t[idx] < PROXIMITY_THRESH and idx >= WARMUP_SKIP]
+
+        if not close_events:
+            below_thresh = np.where(
+                (d_min_t < PROXIMITY_THRESH)
+                & (np.arange(n_obs) >= WARMUP_SKIP)
+            )[0]
+            if below_thresh.size == 0:
+                return None
+            close_events = [int(below_thresh[0])]
+
+        close_events = sorted(close_events)
+        deduped = [close_events[0]]
+        for step in close_events[1:]:
+            if step - deduped[-1] > MIN_EVENT_SEP:
+                deduped.append(step)
+            elif d_min_t[step] < d_min_t[deduped[-1]]:
+                deduped[-1] = step
+        deduped = sorted(deduped)
+
+        ego_progress = _cumulative_progress_series(map_name, obss, all_px, all_py, ego)
+        if ego_progress is not None:
+            pass_candidates = []
+            for opp_col, opp_idx in enumerate(opponent_indices):
+                opp_progress = _cumulative_progress_series(map_name, obss, all_px, all_py, opp_idx)
+                if opp_progress is None:
+                    continue
+                gaps = ego_progress - opp_progress
+                state = 1 if gaps[0] > GAP_THRESH else (-1 if gaps[0] < -GAP_THRESH else 0)
+                for step in range(1, n_obs):
+                    if gaps[step] > GAP_THRESH:
+                        if state == -1:
+                            search_start = max(0, step - int(4.0 / DT))
+                            search_end = min(n_obs - 1, step + int(4.0 / DT))
+                            distances_to_opp = opponent_distances[:, opp_col]
+                            local = distances_to_opp[search_start:search_end + 1]
+                            center = search_start + int(np.argmin(local))
+                            pass_candidates.append((step, center, opp_col, opp_idx))
+                            break
+                        state = 1
+                    elif gaps[step] < -GAP_THRESH:
+                        state = -1
+
+            if pass_candidates:
+                _, center, opp_col, opp_idx = min(pass_candidates, key=lambda item: item[0])
+                return _make_record(
+                    agent, ego, opp_idx, opp_col, opponent_indices,
+                    opponent_distances, all_px, all_py, center, n_obs, True,
+                )
+
+        fallback = None
+        for center in deduped:
+            opp_col = int(closest_opp_t[center])
+            opp_idx = opponent_indices[opp_col]
+            distances_to_opp = opponent_distances[:, opp_col]
+            win_start, win_end, _ = _event_window(center, distances_to_opp, n_obs)
+
+            record = _make_record(
+                agent, ego, opp_idx, opp_col, opponent_indices,
+                opponent_distances, all_px, all_py, center, n_obs, False,
+            )
+            if fallback is None:
+                fallback = record
+
+            ego_start = _progress_at(map_name, obss, all_px, all_py, ego, win_start)
+            ego_end = _progress_at(map_name, obss, all_px, all_py, ego, win_end)
+            opp_start = _progress_at(map_name, obss, all_px, all_py, opp_idx, win_start)
+            opp_end = _progress_at(map_name, obss, all_px, all_py, opp_idx, win_end)
+            if None in (ego_start, ego_end, opp_start, opp_end):
+                return fallback
+
+            gap_start = ego_start - opp_start
+            gap_end = ego_end - opp_end
+            if gap_start < -GAP_THRESH and gap_end > GAP_THRESH:
+                record['is_pass'] = True
+                return record
+
+        return fallback
+
+    agents_to_plot = agents if agents is not None else sorted(data.keys())
+    agents_to_plot = [agent for agent in agents_to_plot if agent in data]
+    if not agents_to_plot:
+        print("  [first_overtake_overlay] No requested agents found - skipping.")
+        return
+
+    map_names = sorted({map_name for agent in agents_to_plot
+                        for map_name in data.get(agent, {})})
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+    for map_name in map_names:
+        records = []
+        for agent in agents_to_plot:
+            record = _first_overtake_event(agent, map_name, data.get(agent, {}).get(map_name, []))
+            if record is None:
+                print(f"  [first_overtake_overlay] {agent}/{map_name}: no close pass found.")
+                continue
+            records.append(record)
+
+        if not records:
+            continue
+
+        map_image = _load_map_image(map_name)
+        if map_image is None:
+            print(f"  [first_overtake_overlay] {map_name}: map image unavailable - skipping.")
+            continue
+        raceline_xy = _load_raceline(map_name)
+
+        focus_x = []
+        focus_y = []
+        for record in records:
+            all_px = record['all_px']
+            all_py = record['all_py']
+            ego = record['ego']
+            opp_idx = record['opp_idx']
+            for step in record['steps']:
+                focus_x.extend([all_px[step, ego], all_px[step, opp_idx]])
+                focus_y.extend([all_py[step, ego], all_py[step, opp_idx]])
+
+        cx = float(np.mean(focus_x))
+        cy = float(np.mean(focus_y))
+        span_x = max(focus_x) - min(focus_x)
+        span_y = max(focus_y) - min(focus_y)
+        view_radius = max(zoom_radius, span_x / 2 + 1.0, span_y / 2 + 1.0)
+
+        fig, axes = plt.subplots(1, 4, figsize=(5.6 * 4, 5.4), squeeze=False)
+        axes = axes[0]
+
+        for col_idx, ax in enumerate(axes):
+            ax.imshow(
+                map_image['image'],
+                extent=[map_image['x_min'], map_image['x_max'],
+                        map_image['y_min'], map_image['y_max']],
+                aspect='equal', cmap='gray', origin='upper', zorder=0,
+            )
+            if raceline_xy is not None:
+                ax.plot(raceline_xy[:, 0], raceline_xy[:, 1],
+                        color='#AB47BC', linewidth=1.4, alpha=0.55,
+                        zorder=1, label='Raceline' if col_idx == 0 else None)
+
+            for idx, record in enumerate(records):
+                agent = record['agent']
+                color = AGENT_COLORS.get(agent, color_cycle[idx % len(color_cycle)])
+                all_px = record['all_px']
+                all_py = record['all_py']
+                ego = record['ego']
+                opp_idx = record['opp_idx']
+                opp_col = record['opp_col']
+                step = record['steps'][col_idx]
+                n_obs = record['n_obs']
+
+                ego_x = all_px[step, ego]
+                ego_y = all_py[step, ego]
+                opp_x = all_px[step, opp_idx]
+                opp_y = all_py[step, opp_idx]
+                distance_at_step = record['opponent_distances'][step, opp_col]
+
+                far_circle = mpatches.Circle(
+                    (opp_x, opp_y), radius=FAR_THRESH,
+                    fill=True, facecolor=color, alpha=0.08,
+                    edgecolor=color, linewidth=1.5, linestyle='--', zorder=7,
+                )
+                ax.add_patch(far_circle)
+                near_circle = mpatches.Circle(
+                    (opp_x, opp_y), radius=NEAR_THRESH,
+                    fill=True, facecolor=color, alpha=0.12,
+                    edgecolor=color, linewidth=1.8, linestyle='-', zorder=8,
+                )
+                ax.add_patch(near_circle)
+
+                t0 = max(0, step - lookback)
+                ax.plot(all_px[t0:step + 1, ego], all_py[t0:step + 1, ego],
+                        color=color, linewidth=1.6, linestyle='--', alpha=0.7,
+                        zorder=10)
+
+                t1 = min(n_obs, step + lookahead)
+                future_x = all_px[step:t1, ego]
+                future_y = all_py[step:t1, ego]
+                ax.plot(future_x, future_y, color=color, linewidth=2.2,
+                        alpha=0.9, zorder=11,
+                        label=agent if col_idx == 0 else None)
+                if len(future_x) > 2:
+                    ax.annotate(
+                        '', xy=(future_x[-1], future_y[-1]),
+                        xytext=(future_x[0], future_y[0]),
+                        arrowprops=dict(
+                            arrowstyle='-|>', color=color, lw=2.1,
+                            mutation_scale=16, shrinkA=0, shrinkB=0,
+                        ),
+                        zorder=12,
+                    )
+
+                ax.plot(ego_x, ego_y, 'o', color=color, markersize=7,
+                        markeredgecolor='black', markeredgewidth=0.9, zorder=13)
+                ax.plot(opp_x, opp_y, 's', color=color, markersize=6,
+                        markeredgecolor='white', markeredgewidth=0.9, zorder=12)
+                if col_idx in (1, 2):
+                    ax.text(
+                        opp_x, opp_y, f'{distance_at_step:.2f}m',
+                        color='white', fontsize=6, ha='left', va='top', zorder=14,
+                        path_effects=[patheffects.withStroke(linewidth=1.5, foreground='black')],
+                    )
+
+            bar_len = 1.0
+            bar_x0 = cx - view_radius + 0.15 * view_radius
+            bar_y0 = cy - view_radius + 0.12 * view_radius
+            ax.plot([bar_x0, bar_x0 + bar_len], [bar_y0, bar_y0],
+                    color='white', linewidth=2.5, solid_capstyle='butt', zorder=15)
+            ax.text(
+                bar_x0 + bar_len / 2,
+                bar_y0 + 0.08 * view_radius,
+                f'{bar_len:.0f} m',
+                color='white', fontsize=11, ha='center', va='bottom',
+                fontweight='bold', zorder=15,
+                path_effects=[patheffects.withStroke(linewidth=2, foreground='black')],
+            )
+
+            ax.set_xlim(cx - view_radius, cx + view_radius)
+            ax.set_ylim(cy - view_radius, cy + view_radius)
+            ax.set_aspect('equal')
+            ax.set_title(PHASE_LABELS[col_idx], fontsize=14, fontweight='bold')
+            ax.tick_params(labelsize=9)
+
+        axes[0].plot([], [], 'o', color='white', markeredgecolor='black',
+                     label='Ego marker')
+        axes[0].plot([], [], 's', color='white', markeredgecolor='black',
+                     label='Overtaken traffic')
+        axes[0].plot([], [], color='black', linewidth=1.6, linestyle='--',
+                     label='Past path')
+        axes[0].plot([], [], color='black', linewidth=2.2,
+                     label='Future path')
+        axes[0].legend(fontsize=9, loc='upper left', framealpha=0.9,
+                       handlelength=1.5)
+
+        n_pass = sum(1 for record in records if record['is_pass'])
+        fig.suptitle(
+            f"First Overtake Overlay - {map_name} ({n_pass}/{len(records)} pass transitions detected)",
+            fontsize=18, fontweight='bold',
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+        out_dir = f"analysis/map_results/{map_name}"
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = f"{out_dir}/overtake_snapshots_first_overtake_overlay.png"
+        fig.savefig(out_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"  Saved {out_path}")
+
+
 def main():
     race_data = load_race_data(RACE_DATA_PATH)
     lap_comparison = create_lap_comparison(race_data)
-
     plot_lap_stats_table(lap_comparison)
     plot_combined_lap_stats(lap_comparison, COMBINED_MAPS)
     plot_collision_free_survival(lap_comparison)
     plot_lap_time_distribution(lap_comparison)
+    plot_lap_time_by_lap(lap_comparison)
     plot_raceline_on_map_image(lap_comparison)
     plot_velocity_profiles(lap_comparison)
 
     overtake_data = load_overtake_data()
     plot_interaction_metrics(overtake_data)
     plot_overtake_time_series(overtake_data)
+    plot_overtake_snapshots(overtake_data)
+    plot_first_overtake_overlay_snapshots(overtake_data)
 
 
 if __name__ == "__main__":

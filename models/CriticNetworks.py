@@ -296,6 +296,10 @@ class Mamba2CriticNetwork(nn.Module):
             self._conv_state.zero_()
             self._ssm_state.zero_()
         else:
+            agent_idxs = torch.as_tensor(agent_idxs, device=self._conv_state.device, dtype=torch.long).reshape(-1)
+            agent_idxs = agent_idxs[(agent_idxs >= 0) & (agent_idxs < self._conv_state.shape[0])]
+            if agent_idxs.numel() == 0:
+                return
             self._conv_state[agent_idxs] = 0.0
             self._ssm_state[agent_idxs] = 0.0
 
@@ -337,11 +341,16 @@ class Mamba2CriticNetwork(nn.Module):
         # Pre-norm and clamp
         projected_normed = self.pre_mamba_norm(projected)
         projected_normed = torch.clamp(projected_normed, -10.0, 10.0)
+        mamba_dtype = next(self.mamba.parameters()).dtype
+        projected_normed = projected_normed.to(dtype=mamba_dtype)
+        conv_state = conv_state.to(dtype=mamba_dtype)
+        ssm_state = ssm_state.to(dtype=mamba_dtype)
 
         # Mamba2 recurrent step
-        mamba_out, conv_state, ssm_state = self.mamba.step(
-            projected_normed.unsqueeze(1), conv_state, ssm_state
-        )
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            mamba_out, conv_state, ssm_state = self.mamba.step(
+                projected_normed.unsqueeze(1), conv_state, ssm_state
+            )
         critic_features = self.norm_layer(mamba_out.squeeze(1))
 
         if _using_internal:

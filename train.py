@@ -41,7 +41,7 @@ EASY_MAPS = ["Hockenheim", "Monza", "Melbourne", "BrandsHatch"]
 MEDIUM_MAPS = ["Sakhir", "SaoPaulo", "Budapest", "Silverstone"]
 HARD_MAPS = ["Zandvoort", "MoscowRaceway", "Sochi",]
 TOTAL_TIMESTEPS = _env_int("TR_TOTAL_TIMESTEPS", 12_000_000)
-STEPS_PER_GENERATION = 2048
+STEPS_PER_GENERATION = _env_int("TR_STEPS_PER_GENERATION", 2048)
 INITIAL_POSES = None
 CURRENT_MAP = _env_str("TR_START_MAP", "Zandvoort")
 PATIENCE = _env_int("TR_PATIENCE", 200)  # Early stopping patience
@@ -53,6 +53,7 @@ RESET_OPT_ON_MAP_SWITCH = os.getenv("TR_RESET_OPT_ON_MAP_SWITCH", "1") == "1"
 HELDOUT_MAPS = ["Spa", "YasMarina", "Spielberg"]
 HELDOUT_EVAL_EVERY = _env_int("TR_HELDOUT_EVAL_EVERY", 12)  # Generations between held-out evaluations
 MIN_SELECTION_SPEED = _env_float("TR_MIN_SELECTION_SPEED", 4.5)
+MIN_SELECTION_SPEED_RATIO = _env_float("TR_MIN_SELECTION_SPEED_RATIO", 0.85)
 MIN_SELECTION_PROGRESS_PER_STEP = _env_float(
     "TR_MIN_SELECTION_PROGRESS_PER_STEP", 0.055
 )
@@ -74,8 +75,12 @@ def compute_selection_score(
     score = float(dist_per_collision) * speed_ratio
 
     gate = 1.0
-    if avg_speed < MIN_SELECTION_SPEED:
-        gate *= max(avg_speed, 0.0) / max(MIN_SELECTION_SPEED, 1e-6)
+    min_speed = max(
+        float(MIN_SELECTION_SPEED),
+        float(MIN_SELECTION_SPEED_RATIO) * float(raceline_mean_speed),
+    )
+    if avg_speed < min_speed:
+        gate *= max(avg_speed, 0.0) / max(min_speed, 1e-6)
     if progress_per_step is not None and progress_per_step < MIN_SELECTION_PROGRESS_PER_STEP:
         gate *= max(progress_per_step, 0.0) / max(MIN_SELECTION_PROGRESS_PER_STEP, 1e-6)
 
@@ -167,8 +172,8 @@ obs, timestep, _, _ = env.reset(poses=INITIAL_POSES)
 env.render(mode="human")
 
 
-ORIGINAL_WEIGHT = "models/actor/pretrained/actor_pretrained.pt"
-CRITIC_WEIGHT = "models/critic/pretrained/critic_pretrained.pt"
+ORIGINAL_WEIGHT = "models/actor/pretrained/masked_test/actor_masked_final.pt"
+CRITIC_WEIGHT = "models/critic/critic_best.pt"
 
 agent = PPOAgent(
     num_agents=NUM_AGENTS_AI,
@@ -203,11 +208,16 @@ if CRITIC_WEIGHT is None:
     )
     CRITIC_WEIGHT = "models/critic/pretrained/critic_pretrained.pt"
 
-def _validate_procedural_track(map_name, n_steps=40, crash_window=10):
+def _validate_procedural_track(
+    map_name,
+    n_steps=40,
+    crash_window=10,
+    min_progress_m=0.5,
+):
     """Smoke-test a freshly generated track with pure-pursuit.
 
     Returns True iff every AI agent survives the first ``crash_window``
-    steps and at least one AI agent makes forward progress (>1 m) within
+    steps and at least one AI agent makes forward progress within
     ``n_steps``.  This rejects tracks that spawn agents into walls (the
     dominant cause of dead procedural generations) without paying for a
     full rollout.
@@ -221,6 +231,10 @@ def _validate_procedural_track(map_name, n_steps=40, crash_window=10):
         pp_driver.update_map(map_name)
         poses = generate_start_poses(map_name, NUM_AGENTS)
         obs, _, _, _ = env.reset(poses=poses)
+        reset_cols = np.asarray(obs["collisions"][:NUM_AGENTS_AI])
+        if np.any(reset_cols == 1):
+            print(f"  [validate] {map_name}: wall collision on reset")
+            return False
         start_x = np.array(obs["poses_x"][:NUM_AGENTS_AI], dtype=np.float64)
         start_y = np.array(obs["poses_y"][:NUM_AGENTS_AI], dtype=np.float64)
         for step in range(n_steps):
@@ -232,12 +246,21 @@ def _validate_procedural_track(map_name, n_steps=40, crash_window=10):
             obs, _, _, _ = env.step(acts)
             cols = np.asarray(obs["collisions"][:NUM_AGENTS_AI])
             if step < crash_window and np.any(cols == 1):
+                print(f"  [validate] {map_name}: wall collision at step {step + 1}")
                 return False
-        # At least one AI agent must have moved >1 m
+        # At least one AI agent must move far enough to show the map is drivable.
+        # With the simulator's 0.01s timestep and validation min-speed of 1.5 m/s,
+        # 40 steps only covers ~0.6m before controller/dynamics effects.
         end_x = np.array(obs["poses_x"][:NUM_AGENTS_AI], dtype=np.float64)
         end_y = np.array(obs["poses_y"][:NUM_AGENTS_AI], dtype=np.float64)
         max_disp = float(np.max(np.hypot(end_x - start_x, end_y - start_y)))
-        return max_disp > 1.0
+        if max_disp <= min_progress_m:
+            print(
+                f"  [validate] {map_name}: insufficient motion "
+                f"({max_disp:.2f}m <= {min_progress_m:.2f}m)"
+            )
+            return False
+        return True
     except Exception as exc:
         print(f"  [validate] exception: {exc}")
         return False
@@ -269,7 +292,7 @@ def _switch_to_new_track(gen_label="init"):
             track_name = candidate
             break
         # Reject: tear down and try again
-        print(f"  [validate] rejecting {candidate} (immediate-collision spawn)")
+        print(f"  [validate] rejecting {candidate}")
         bad_dir = os.path.join("maps", candidate)
         if os.path.isdir(bad_dir):
             shutil.rmtree(bad_dir, ignore_errors=True)
@@ -302,7 +325,7 @@ def _switch_to_new_track(gen_label="init"):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Scale steps
+    # Rescale rewards for the new map while keeping rollout length fixed.
     _update_steps_and_buffer(rl)
 
     return INITIAL_POSES
@@ -380,10 +403,7 @@ agent.mixed_map_generation = MAPS_PER_GEN > 1
 
 
 def _update_steps_and_buffer(raceline_length):
-    """Resize rollout length and normalize progress reward for a map."""
-    global STEPS_PER_GENERATION
-    STEPS_PER_GENERATION = int(raceline_length) * 5
-
+    """Normalize progress reward for a map and reset temporal state."""
     agent.PROGRESS_REWARD = 500.0 / max(raceline_length, 1.0)
 
     agent.reset_buffers()
@@ -405,7 +425,11 @@ patience = 0
 _critic_warmup_remaining = 0
 
 CHECKPOINT_PATH = _env_str("TR_CHECKPOINT_PATH", "models/checkpoint.pt")
-resumed = None if SKIP_RESUME else agent.load_checkpoint(CHECKPOINT_PATH)
+RESUME_CHECKPOINT_PATH = _env_str("TR_RESUME_CHECKPOINT", CHECKPOINT_PATH)
+print(f"[startup] transfer actor={ORIGINAL_WEIGHT}, critic={CRITIC_WEIGHT}")
+print(f"[startup] resume_checkpoint={RESUME_CHECKPOINT_PATH}, save_checkpoint={CHECKPOINT_PATH}, "
+    f"resume={'off' if SKIP_RESUME else 'on'}")
+resumed = None if SKIP_RESUME else agent.load_checkpoint(RESUME_CHECKPOINT_PATH)
 start_gen = 0
 if resumed is not None:
     start_gen = resumed["generation"]
@@ -422,9 +446,27 @@ COLLISION_RESET_THRESHOLD = 20
 total_steps_done = start_gen * STEPS_PER_GENERATION
 gen = start_gen
 focus_map = CURRENT_MAP
+next_focus_is_generated = True
+force_initial_generated_switch = True
 while total_steps_done < TOTAL_TIMESTEPS and (MAX_GENERATIONS <= 0 or gen < MAX_GENERATIONS):
     collisions = 0
     gen += 1
+
+    if force_initial_generated_switch:
+        _startup_mode = "Resumed" if start_gen > 0 else "Starting"
+        print(
+            f"[curriculum] {_startup_mode} at generation {start_gen}; "
+            f"switching to a generated track before generation {gen}."
+        )
+        _switch_to_new_track(gen)
+        focus_map = CURRENT_MAP
+        next_focus_is_generated = False
+        obs, _, _, _ = env.reset(poses=INITIAL_POSES)
+        agent.reset_progress_trackers(initial_poses_xy=INITIAL_POSES[:, :2])
+        agent.reset_buffers()
+        collision_timers[:] = 0
+        _critic_warmup_remaining = CRITIC_WARMUP_GENS
+        force_initial_generated_switch = False
 
     print(f"--- Generation {gen} focus={focus_map}  "
           f"(steps={STEPS_PER_GENERATION}, "
@@ -747,16 +789,14 @@ S/s: {1 / (time.time() - timer):.1f}", end='\r')
                 )
             agent.clear_experience_buffer()
 
-        # Alternate: odd cycles → generated track, even cycles → real map
-        cycle = gen // GEN_PER_MAP
-        if cycle % 2 == 0:
-            # Pick a random real map from the curriculum pool
+        if next_focus_is_generated:
+            _switch_to_new_track(gen)
+            focus_map = CURRENT_MAP  # Generated track: disables Option B rotation
+        else:
             pool = get_curriculum_map_pool(gen)
             _switch_to_real_map(random.choice(pool))
             focus_map = CURRENT_MAP
-        else:
-            _switch_to_new_track(gen)
-            focus_map = CURRENT_MAP  # Generated track: disables Option B rotation
+        next_focus_is_generated = not next_focus_is_generated
 
         print(f"Gen {gen}: New focus map \u2192 {CURRENT_MAP}  "
               f"(steps/gen={STEPS_PER_GENERATION})")

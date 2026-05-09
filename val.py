@@ -66,8 +66,8 @@ def parse_args():
                    help="Max speed for baselines on generated tracks")
     p.add_argument("--action-repeat", type=int, default=5,
                    help="Action repeat interval (1=every step, 5=every 5th)")
-    p.add_argument("--ddim-steps", type=int, default=1,
-                   help="DDIM denoising steps for deployment (1-5)")
+    p.add_argument("--ddim-steps", type=int, default=5,
+                   help="DDIM denoising steps for deployment")
     p.add_argument("--no-deploy", action="store_true",
                    help="Disable deploy optimisations (use full DDPM)")
     return p.parse_args()

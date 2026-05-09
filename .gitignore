@@ -1,8 +1,9 @@
 .*/
 _*/
 models/actor/*
+models/*.pt
 models/critic/*
-*/map_results/
+*/map_results*/
 *.pkl
 *.whl
 demos/*
@@ -12,3 +13,6 @@ maps/test_*
 maps/debug_*
 analysis/snapshots/*
 plots/results/*
+*.mp4
+paper*/
+analysis/*/*.csv

@@ -23,11 +23,11 @@ Outputs:
 """
 
 import argparse
+import csv
 import os
 import sys
 import time
 import random
-import math
 import numpy as np
 import torch
 torch.backends.cudnn.benchmark = True
@@ -54,6 +54,17 @@ if RACING_RL_PATH not in sys.path:
 PARAMS_DICT = SIM_PARAMS.copy()
 NUM_BEAMS = LIDAR_BEAMS
 STATE_DIM = D2PPO_STATE_DIM
+
+BEST_GFPP_PARAMS = {
+    "lookahead_distance": 1.4,
+    "threshold_at_v_min": 1.0,
+    "threshold_at_v_max": 2.5,
+}
+BEST_MPC_PARAMS = {
+    "horizon": 8,
+    "speed_scale": 0.8,
+    "emergency_dist": 0.8,
+}
 
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -540,6 +551,337 @@ def collect_demos_pretrained(
 
     if verbose:
         print(f"\n[Demo] Total demonstrations collected: {len(demos)}")
+    return demos
+
+
+def _normalise_plan_agent_label(label: str) -> str:
+    aliases = {
+        "BC-LSTM": "BC_LSTM",
+        "D²PPO": "D2PPO",
+        "D2PPO": "D2PPO",
+    }
+    return aliases.get(str(label).strip(), str(label).strip())
+
+
+def _as_plan_action_batch(action, source: str) -> np.ndarray:
+    action_np = np.asarray(action, dtype=np.float32)
+    if action_np.ndim == 1:
+        if action_np.size != 2:
+            raise ValueError(f"{source} returned action with shape {action_np.shape}")
+        action_np = action_np.reshape(1, 2)
+    elif action_np.ndim > 2:
+        action_np = action_np.reshape(-1, action_np.shape[-1])
+    if action_np.ndim != 2 or action_np.shape[1] < 2:
+        raise ValueError(f"{source} returned action batch with shape {action_np.shape}")
+    return action_np[:, :2].astype(np.float32, copy=False)
+
+
+def _build_plan_agent(
+    label: str,
+    map_name: str,
+    num_agents: int,
+    bc_lstm_weights: str,
+    d2ppo_weights: str,
+):
+    label = _normalise_plan_agent_label(label)
+    if label == "BC_LSTM":
+        from analysis.bc_lstm_agent import BCLSTMAgent
+        return BCLSTMAgent(num_agents=num_agents, weights_path=bc_lstm_weights)
+
+    if label == "D2PPO":
+        from D2PPO_agent import D2PPOAgent
+        d2ppo = D2PPOAgent(
+            num_agents=num_agents,
+            map_name=map_name,
+            steps=None,
+            params=PARAMS_DICT,
+            transfer=[d2ppo_weights, None],
+        )
+        d2ppo.deploy(action_repeat=0, ddim_steps=5, compile_model=False)
+        return d2ppo
+
+    if label == "GFPP":
+        from baselines.gap_follow_pure_pursuit import GapFollowPurePursuit
+        return GapFollowPurePursuit(
+            map_name=map_name,
+            wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
+            max_steering=PARAMS_DICT['s_max'],
+            num_beams=NUM_BEAMS,
+            fov=LIDAR_FOV,
+            speed_clamp=None,
+            **BEST_GFPP_PARAMS,
+        )
+
+    if label == "MPC":
+        return MPCAgent(
+            map_name=map_name,
+            wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
+            max_steering=PARAMS_DICT['s_max'],
+            max_accel=PARAMS_DICT['a_max'],
+            speed_clamp=None,
+            **BEST_MPC_PARAMS,
+        )
+
+    raise ValueError(f"Unknown plan agent label: {label}")
+
+
+def _build_plan_traffic(map_name: str):
+    from baselines.pure_pursuit import PurePursuit
+    return PurePursuit(
+        map_name=map_name,
+        lookahead_distance=1.5,
+        wheelbase=PARAMS_DICT['lf'] + PARAMS_DICT['lr'],
+        max_steering=PARAMS_DICT['s_max'],
+        max_speed=8.0,
+        min_speed=2.0,
+    )
+
+
+def _plan_scenario(row: dict) -> str:
+    scenario = str(row.get("scenario", "no_opp")).strip()
+    if scenario not in {"no_opp", "overtake"}:
+        raise ValueError(f"Unknown plan scenario: {scenario}")
+    return scenario
+
+
+def _plan_traffic_agent_count(row: dict, num_overtake_agents: int) -> int:
+    scenario = _plan_scenario(row)
+    return int(num_overtake_agents) if scenario == "overtake" else 0
+
+
+def _plan_agent_actions(agent, label: str, obs: dict, num_agents: int) -> np.ndarray:
+    label = _normalise_plan_agent_label(label)
+    if label in {"BC_LSTM", "D2PPO"}:
+        with torch.no_grad():
+            scan_tensors, state_tensor = agent._obs_to_tensors(obs)
+            action_tensor, _, _ = agent.get_action_and_value(
+                scan_tensors, state_tensor, deterministic=True)
+        action_np = action_tensor.detach().cpu().numpy()
+        action_np = np.nan_to_num(action_np, nan=0.0, posinf=0.0, neginf=0.0)
+        return _as_plan_action_batch(action_np, label)[:num_agents]
+
+    return _as_plan_action_batch(agent.get_actions_batch(obs), label)[:num_agents]
+
+
+def _reset_plan_agent(agent, agent_idxs=None):
+    if hasattr(agent, "reset_buffers"):
+        try:
+            agent.reset_buffers(agent_idxs=agent_idxs)
+        except TypeError:
+            agent.reset_buffers()
+
+
+def _plan_lap_status(next_obs: dict, num_agents: int, target_laps: int):
+    lap_counts = np.asarray(next_obs["lap_counts"][:num_agents], dtype=np.float32)
+    lap_done = lap_counts >= int(target_laps)
+    return lap_counts, lap_done, bool(np.all(lap_done))
+
+
+def _collect_plan_row(
+    row: dict,
+    num_agents: int,
+    target_laps: int,
+    max_steps_per_map: int,
+    collision_reset_threshold: int,
+    num_overtake_agents: int,
+    bc_lstm_weights: str,
+    d2ppo_weights: str,
+    verbose: bool = True,
+) -> list[dict]:
+    map_name = row["map"]
+    scenario = _plan_scenario(row)
+    agent_label = _normalise_plan_agent_label(row["agent"])
+    overtake_agents = _plan_traffic_agent_count(row, num_overtake_agents)
+    total_agents = num_agents + overtake_agents
+    target_laps = max(1, int(target_laps))
+    max_steps_per_map = max(1, int(max_steps_per_map))
+
+    env = gym.make(
+        "f110_gym:f110-v0",
+        map=get_map_dir(map_name) + f"/{map_name}_map",
+        num_agents=total_agents,
+        num_beams=NUM_BEAMS,
+        fov=LIDAR_FOV,
+        params=PARAMS_DICT,
+    )
+    agent = _build_plan_agent(
+        agent_label, map_name, num_agents,
+        bc_lstm_weights=bc_lstm_weights,
+        d2ppo_weights=d2ppo_weights,
+    )
+    traffic_agent = _build_plan_traffic(map_name) if overtake_agents > 0 else None
+
+    poses = generate_start_poses(map_name, total_agents, race=True)
+    obs, _, _, _ = env.reset(poses=poses)
+    _reset_plan_agent(agent)
+    collision_timers = np.zeros(total_agents, dtype=np.int32)
+    demos: list[dict] = []
+
+    try:
+        for step in range(max_steps_per_map):
+            ego_actions = _plan_agent_actions(agent, agent_label, obs, num_agents)
+            if traffic_agent is not None:
+                traffic_actions = _as_plan_action_batch(
+                    traffic_agent.get_actions_batch(obs), "plan_traffic")
+                actions = np.vstack((ego_actions, traffic_actions[num_agents:total_agents]))
+            else:
+                actions = ego_actions
+
+            next_obs, _, _, _ = env.step(actions)
+
+            collisions = np.asarray(next_obs["collisions"], dtype=np.int32)
+            velocities = np.asarray(next_obs["linear_vels_x"], dtype=np.float32)
+            lap_counts, lap_done, target_reached = _plan_lap_status(
+                next_obs, num_agents, target_laps)
+            wall_collisions = collisions == 1
+            collision_timers[wall_collisions] += 1
+            collision_timers[~wall_collisions] = 0
+            collision_exit = collision_timers[:num_agents] >= collision_reset_threshold
+            collision_exit_reached = bool(np.any(collision_exit))
+
+            for agent_idx in range(num_agents):
+                demos.append({
+                    "scan": np.asarray(obs["scans"][agent_idx], dtype=np.float32).copy(),
+                    "state": np.array([
+                        obs["linear_vels_x"][agent_idx],
+                        obs["linear_vels_y"][agent_idx],
+                        obs["ang_vels_z"][agent_idx],
+                    ], dtype=np.float32),
+                    "action": actions[agent_idx].astype(np.float32, copy=True),
+                    "map": map_name,
+                    "step": step,
+                    "agent": f"{scenario}:{agent_label}:{agent_idx}",
+                    "source_agent": agent_label,
+                    "scenario": scenario,
+                    "traffic_agents": overtake_agents,
+                    "target_laps": target_laps,
+                    "lap_count": float(lap_counts[agent_idx]),
+                    "next_velocity": float(velocities[agent_idx]),
+                    "next_collision": int(collisions[agent_idx]),
+                    "done": int(collision_exit[agent_idx] or lap_done[agent_idx]),
+                })
+
+            if target_reached:
+                if verbose:
+                    print(
+                        f"    {scenario}/{map_name}/{agent_label}: "
+                        f"completed {target_laps} laps in {step + 1} steps",
+                        flush=True,
+                    )
+                break
+
+                if collision_exit_reached:
+                    if verbose:
+                        print(
+                            f"    {scenario}/{map_name}/{agent_label}: "
+                            f"wall collision exit after {step + 1} steps",
+                            flush=True,
+                        )
+                    break
+
+            obs = next_obs
+
+            if verbose and step > 0 and step % 1000 == 0:
+                lap_min = float(np.min(lap_counts)) if len(lap_counts) else 0.0
+                print(
+                    f"    {scenario}/{map_name}/{agent_label}: "
+                    f"step {step}/{max_steps_per_map}, "
+                    f"laps={lap_min:.1f}/{target_laps}",
+                    flush=True,
+                )
+    finally:
+        env.close()
+
+    return demos
+
+
+def collect_demos_from_plan(
+    plan_csv: str,
+    num_agents: int = 3,
+    target_laps: int = 3,
+    max_steps_per_map: int = 7000,
+    collision_reset_threshold: int = 32,
+    num_overtake_agents: int = 5,
+    bc_lstm_weights: str = "../racing_rl/actor_val_best.pt",
+    d2ppo_weights: str = "actor_best3_goodenough_for677.pt",
+    max_workers: int | None = None,
+    verbose: bool = True,
+) -> list[dict]:
+    with open(plan_csv, newline="") as file:
+        rows = list(csv.DictReader(file))
+    if not rows:
+        raise ValueError(f"No rows found in plan CSV: {plan_csv}")
+    target_laps = max(1, int(target_laps))
+    max_steps_per_map = max(1, int(max_steps_per_map))
+
+    if max_workers is None:
+        max_workers = min(len(rows), mp.cpu_count())
+    max_workers = max(1, max_workers)
+
+    demos: list[dict] = []
+    if verbose:
+        no_opp_rows = sum(1 for row in rows if _plan_scenario(row) == "no_opp")
+        overtake_rows = len(rows) - no_opp_rows
+        print(
+            f"\n[Plan Demo] Collecting from {len(rows)} planned agent/map rows "
+            f"with {max_workers} parallel workers"
+        )
+        print(
+            f"            targeting {target_laps} laps per row "
+            f"(safety cap: {max_steps_per_map} steps)"
+        )
+        print(
+            f"            no_opp rows use 0 traffic agents; "
+            f"overtake rows use {num_overtake_agents} traffic agents "
+            f"({no_opp_rows} no_opp, {overtake_rows} overtake)"
+        )
+
+    failures = []
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for row_idx, row in enumerate(rows, start=1):
+            scenario = _plan_scenario(row)
+            traffic_agents = _plan_traffic_agent_count(row, num_overtake_agents)
+            if verbose:
+                print(
+                    f"  queued [{row_idx}/{len(rows)}] {scenario} "
+                    f"{row['map']} with {row['agent']} "
+                    f"(traffic_agents={traffic_agents})"
+                )
+            future = pool.submit(
+                _collect_plan_row,
+                row,
+                num_agents,
+                target_laps,
+                max_steps_per_map,
+                collision_reset_threshold,
+                num_overtake_agents,
+                bc_lstm_weights,
+                d2ppo_weights,
+                verbose,
+            )
+            futures[future] = (row_idx, row, scenario, traffic_agents)
+
+        for future in as_completed(futures):
+            row_idx, row, scenario, traffic_agents = futures[future]
+            try:
+                row_demos = future.result()
+                demos.extend(row_demos)
+                if verbose:
+                    print(
+                        f"  ✓ [{row_idx}/{len(rows)}] {scenario} {row['map']} "
+                        f"with {row['agent']}: {len(row_demos)} demos "
+                        f"(traffic_agents={traffic_agents}, total={len(demos)})"
+                    )
+            except Exception as exc:
+                failures.append((row_idx, row, exc))
+                print(
+                    f"  ✗ [{row_idx}/{len(rows)}] {scenario} {row['map']} "
+                    f"with {row['agent']} failed: {exc}"
+                )
+
+    if failures and not demos:
+        raise RuntimeError(f"All {len(failures)} plan collection rows failed")
     return demos
 
 
@@ -1048,31 +1390,45 @@ def main():
         "Catalunya", "Sepang", "Nuerburgring"  # confirmed lap_counts >= 1
     ]
 
-    parser = argparse.ArgumentParser(description="D²PPO Stage 1: BC Pre-training from MPC")
+    parser = argparse.ArgumentParser(description="D²PPO Stage 1: BC Pre-training")
     parser.add_argument("--maps", nargs="+", default=ALL_MAPS,
                         help="Maps to collect demos on (default: all)")
     parser.add_argument("--completable_only", action="store_true",
                         help="Only use maps the racing_rl agent can complete "
                              "(Catalunya, Sepang). Overrides --maps.")
-    parser.add_argument("--num_agents", type=int, default=3,
+    parser.add_argument("--num_agents", type=int, default=1,
                         help="Agents per env during collection")
-    parser.add_argument("--steps_per_map", type=int, default=7000,
-                        help="Env steps per map during collection")
+    parser.add_argument("--steps_per_map", type=int, default=10000,
+                        help="Env steps per map during collection; in plan mode, this is a safety cap")
     parser.add_argument("--max_workers", type=int, default=None,
                         help="Parallel processes for demo collection (default: min(num_maps, cpu_count))")
     parser.add_argument("--load", type=str, default=None,
                         help="Path to a saved demos .pt file (skip collection)")
+    parser.add_argument("--demo_source", type=str, default="pretrained",
+                        choices=["mpc", "pretrained", "plan"],
+                        help="Demo source when --load is not used")
     parser.add_argument("--save_demos", type=str, default="demos/expert_demos.pt",
                         help="Where to save collected demos for reuse")
     parser.add_argument("--pretrained_expert", type=str, default="../racing_rl/actor_val_best.pt",
                         help="Path to pretrained model (.pt) from racing_rl to use as expert "
                              "(default: None, uses MPC as expert)")
+    parser.add_argument("--collection_plan_csv", type=str,
+                        default="analysis/analysis/weight_initializer_agent_plan.csv",
+                        help="CSV generated by analysis/generate_weight_initializer_plan.py")
+    parser.add_argument("--plan_overtake_agents", type=int, default=5,
+                        help="Number of slow traffic agents to add for overtake plan rows")
+    parser.add_argument("--plan_laps", type=int, default=3,
+                        help="Target laps to collect for each plan row")
+    parser.add_argument("--bc_lstm_weights", type=str, default="../racing_rl/actor_val_best.pt",
+                        help="BC-LSTM checkpoint used when the plan selects BC_LSTM")
+    parser.add_argument("--d2ppo_weights", type=str, default="actor_best3_goodenough_for677.pt",
+                        help="D2PPO checkpoint used when the plan selects D2PPO")
     parser.add_argument("--model_type", type=str, default="mamba2", choices=["lstm", "mamba2"],
                         help="Network architecture backbone (lstm or mamba2)")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--tbtt_length", type=int, default=512,
                         help="TBTT window length (number of timesteps per chunk)")
-    parser.add_argument("--traj_batch_size", type=int, default=9,
+    parser.add_argument("--traj_batch_size", type=int, default=1,
                         help="Number of trajectories to process in parallel")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--dispersive_lambda", type=float, default=0.5)
@@ -1097,7 +1453,24 @@ def main():
         print(f"[Main] Loading demos from {args.load}")
         demos = torch.load(args.load, weights_only=False)
         print(f"[Main] Loaded {len(demos)} demos")
-    elif args.pretrained_expert:
+    elif args.demo_source == "plan":
+        demos = collect_demos_from_plan(
+            plan_csv=args.collection_plan_csv,
+            num_agents=args.num_agents,
+            target_laps=args.plan_laps,
+            max_steps_per_map=args.steps_per_map,
+            collision_reset_threshold=32,
+            num_overtake_agents=args.plan_overtake_agents,
+            bc_lstm_weights=args.bc_lstm_weights,
+            d2ppo_weights=args.d2ppo_weights,
+            max_workers=args.max_workers,
+        )
+        os.makedirs(os.path.dirname(args.save_demos) or ".", exist_ok=True)
+        torch.save(demos, args.save_demos)
+        print(f"[Main] Plan demos saved to {args.save_demos}")
+    elif args.demo_source == "pretrained":
+        if not args.pretrained_expert:
+            raise ValueError("--demo_source pretrained requires --pretrained_expert")
         print(f"[Main] Using pretrained expert: {args.pretrained_expert}")
         demos = collect_demos_pretrained(
             maps=args.maps,
@@ -1108,7 +1481,7 @@ def main():
         os.makedirs(os.path.dirname(args.save_demos) or ".", exist_ok=True)
         torch.save(demos, args.save_demos)
         print(f"[Main] Demos saved to {args.save_demos}")
-    else:
+    elif args.demo_source == "mpc":
         demos = collect_demos(
             maps=args.maps,
             num_agents=args.num_agents,

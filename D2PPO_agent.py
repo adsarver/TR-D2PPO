@@ -184,7 +184,7 @@ class D2PPOAgent:
         self.ppo_clip_coef = 0.1
         self.use_ppo_diffusion = True
         self.kl_target = 0.5
-        self.kl_early_stop = 1.0
+        self.kl_early_stop = 0.75
         self._old_denoise_net = None
         self._last_denoising_chain = None
         self._last_ddim_schedule = None
@@ -199,22 +199,39 @@ class D2PPOAgent:
         self.current_lap_count = np.zeros(self.num_agents, dtype=int)
         self.last_checkpoint = np.zeros(self.num_agents, dtype=int)
 
-        self.LAP_REWARD = 10.0
+        self.LAP_REWARD = 20.0
         self.CHECKPOINT_REWARD = 1.0
-        self.COLLISION_PENALTY = -5.0
+        self.COLLISION_PENALTY = -8.0
         self.PROGRESS_REWARD = 1.0
-        self.AGENT_COLLISION_PENALTY = -1.0
+        self.AGENT_COLLISION_PENALTY = -2.0
         self.NUM_CHECKPOINTS = 10
         self.STEER_RATE_PENALTY = -0.5
         self.STEER_ABS_PENALTY = 0.0
-        self.SPEED_BONUS = 0.008
-        self.SPEED_BONUS_FLOOR = 3.0
-        self.SPEED_BONUS_CAP = 10.0
-        self.SPEED_BONUS_STEER_GATE = 0.2
+        self.PROGRESS_SPEED_BASE = 0.65
+        self.PROGRESS_SPEED_GAIN = 0.90
+        self.PROGRESS_SPEED_MAX = 2.05
+        self.SPEED_BONUS = 0.012
+        self.SPEED_BONUS_FLOOR = 4.0
+        self.SPEED_BONUS_CAP = 14.0
+        self.SPEED_BONUS_STEER_GATE = 0.45
+        self.SPEED_BONUS_CLEARANCE_MIN = 1.25
+        self.SPEED_BONUS_CLEARANCE_FULL = 4.0
+        self.WALL_SPEED_PENALTY_GAIN = 1.0
+        self.PACE_FLOOR_PENALTY = -0.03
+        self.MIN_PACE_RATIO = 0.45
+        self.TRAFFIC_SAFE_DISTANCE = 1.10
+        self.TRAFFIC_CRITICAL_DISTANCE = 0.45
+        self.TRAFFIC_CLEARANCE_PENALTY = -0.35
+        self.OVERTAKE_INTERACTION_DISTANCE = 8.0
+        self.OVERTAKE_PROGRESS_REWARD = 0.08
+        self.PASS_CONFIRM_GAP = 0.75
+        self.PASS_BONUS = 2.5
         self._prev_lap_counts = np.zeros(self.num_agents, dtype=int)
         self._was_colliding_wall = np.zeros(self.num_agents, dtype=bool)
         self._was_colliding_agent = np.zeros(self.num_agents, dtype=bool)
         self._last_steer = np.zeros(self.num_agents, dtype=np.float64)
+        self._last_overtake_gap = np.zeros(self.num_agents, dtype=np.float64)
+        self._has_overtake_gap = np.zeros(self.num_agents, dtype=bool)
 
         self._reward_ema_mean = 0.0
         self._reward_ema_var = 1.0
@@ -406,16 +423,17 @@ class D2PPOAgent:
             except (TypeError, ValueError):
                 pass
 
-    def deploy(self, action_repeat=0, ddim_steps=1, compile_model=True):
+    def deploy(self, action_repeat=0, ddim_steps=5, compile_model=True):
         """Switch to optimised deployment inference.
 
         Optimisations applied:
-        1. DDIM-``ddim_steps`` instead of full 100-step DDPM.  The D2PPO
-           paper uses 0 intermediate DDIM steps (``ddim_steps=1``, i.e.
-           a single denoiser call that jumps directly to x_0).
+          1. DDIM-``ddim_steps`` instead of full 100-step DDPM.  The D2PPO
+              paper uses a one-call sampler, but this implementation defaults to
+              DDIM-5 because it is much more stable for the current pretrained
+              checkpoints.
         2. Action repeat — only run inference every ``action_repeat`` sim
            steps; intermediate steps reuse the cached action.
-        3. Full fp16 inference (safe with ≤2 DDIM steps).
+        3. Full fp16 inference.
         4. ``torch.compile`` for fused kernels (optional, ~2x on Ampere+).
         5. Critic network is deleted to free VRAM.
 
@@ -1089,6 +1107,15 @@ class D2PPOAgent:
         steer_r = np.zeros(self.num_agents)
         steer_abs_r = np.zeros(self.num_agents)
         speed_r = np.zeros(self.num_agents)
+        pace_floor_r = np.zeros(self.num_agents)
+        traffic_clearance_r = np.zeros(self.num_agents)
+        overtake_progress_r = np.zeros(self.num_agents)
+        pass_r = np.zeros(self.num_agents)
+        speed_ratio = np.clip(
+            speeds.astype(np.float64) / max(float(getattr(self, "raceline_mean_speed", 6.0)), 1e-6),
+            0.0,
+            2.0,
+        )
 
         # --- Track progress: checkpoints + continuous forward progress ---
         for i in range(self.num_agents):
@@ -1110,12 +1137,14 @@ class D2PPOAgent:
                 delta_s += self.raceline_length
             elif delta_s > self.raceline_length * 0.5:
                 delta_s -= self.raceline_length
-            # Only reward forward progress, don't penalise backward (collision resets).
-            # Speed-scaled bonus: reward per meter grows with instantaneous speed,
-            # so the policy cannot maximise return by driving slowly and safely.
-            # Shape: (0.5 + v/v_ref) -> 0.5x at v=0, 1.5x at expert pace, 2.5x at 2x pace.
+            # Reward forward progress more when it preserves expert/raceline pace.
             if delta_s > 0:
-                progress_r[i] = delta_s * self.PROGRESS_REWARD
+                speed_factor = np.clip(
+                    self.PROGRESS_SPEED_BASE + self.PROGRESS_SPEED_GAIN * speed_ratio[i],
+                    self.PROGRESS_SPEED_BASE,
+                    self.PROGRESS_SPEED_MAX,
+                )
+                progress_r[i] = delta_s * self.PROGRESS_REWARD * speed_factor
                 rewards[i] += progress_r[i]
 
             # --- Checkpoint reward (divide track into NUM_CHECKPOINTS segments) ---
@@ -1139,7 +1168,8 @@ class D2PPOAgent:
         # --- COLLISION PENALTIES (one-shot: only on NEW collision events) ---
         new_wall = wall_collisions & ~self._was_colliding_wall
         new_agent = agent_collisions & ~self._was_colliding_agent
-        wall_r = new_wall.astype(np.float64) * self.COLLISION_PENALTY
+        wall_scale = 1.0 + self.WALL_SPEED_PENALTY_GAIN * np.clip(speed_ratio - 1.0, 0.0, 1.0)
+        wall_r = new_wall.astype(np.float64) * self.COLLISION_PENALTY * wall_scale
         agent_r = new_agent.astype(np.float64) * self.AGENT_COLLISION_PENALTY
         self._was_colliding_wall = wall_collisions.copy()
         self._was_colliding_agent = agent_collisions.copy()
@@ -1185,18 +1215,34 @@ class D2PPOAgent:
                 pass
 
         if self.SPEED_BONUS > 0.0:
-            v = np.clip(speeds.astype(np.float64), 0.0, self.SPEED_BONUS_CAP)
-            above = np.clip(v - self.SPEED_BONUS_FLOOR, 0.0, None)
+            v_ref = max(float(getattr(self, "raceline_mean_speed", 6.0)), 1e-6)
+            speed_floor = max(float(self.SPEED_BONUS_FLOOR), 0.65 * v_ref)
+            speed_cap = max(float(self.SPEED_BONUS_CAP), 1.35 * v_ref)
+            v = np.clip(speeds.astype(np.float64), 0.0, speed_cap)
+            above = np.clip(v - speed_floor, 0.0, None)
             forward = progress_r > 0.0
             not_collided = ~(wall_collisions | agent_collisions)
-            # Curvature gate: |self._last_steer| was just updated to the
-            # current step's steer (or stays 0 if action is None).  Bonus
-            # ramps linearly from 1 at |steer|=0 down to 0 at the gate.
-            gate = np.clip(
+            steering_gate = np.clip(
                 1.0 - np.abs(self._last_steer) / max(self.SPEED_BONUS_STEER_GATE, 1e-6),
                 0.0,
                 1.0,
             )
+            clearance_gate = np.ones(self.num_agents, dtype=np.float64)
+            try:
+                scans = np.asarray(next_obs["scans"][:self.num_agents], dtype=np.float64)
+                center = scans.shape[-1] // 2
+                half_width = max(1, scans.shape[-1] // 10)
+                front = scans[:, center - half_width:center + half_width]
+                front_clearance = np.nanpercentile(front, 10, axis=1)
+                clearance_gate = np.clip(
+                    (front_clearance - self.SPEED_BONUS_CLEARANCE_MIN)
+                    / max(self.SPEED_BONUS_CLEARANCE_FULL - self.SPEED_BONUS_CLEARANCE_MIN, 1e-6),
+                    0.0,
+                    1.0,
+                )
+            except (KeyError, TypeError, ValueError, IndexError):
+                pass
+            gate = steering_gate * clearance_gate
             speed_r = (
                 self.SPEED_BONUS
                 * above
@@ -1205,6 +1251,96 @@ class D2PPOAgent:
                 * not_collided.astype(np.float64)
             )
             rewards += speed_r
+
+        not_collided = ~(wall_collisions | agent_collisions)
+        if self.PACE_FLOOR_PENALTY != 0.0:
+            below_floor = np.clip(self.MIN_PACE_RATIO - speed_ratio, 0.0, None)
+            stalled = progress_r <= 0.0
+            pace_floor_r = (
+                self.PACE_FLOOR_PENALTY
+                * below_floor
+                * stalled.astype(np.float64)
+                * not_collided.astype(np.float64)
+            )
+            rewards += pace_floor_r
+
+        try:
+            all_x = np.asarray(next_obs["poses_x"], dtype=np.float64)
+            all_y = np.asarray(next_obs["poses_y"], dtype=np.float64)
+            all_positions = np.column_stack([all_x, all_y])
+            if all_positions.shape[0] > self.num_agents:
+                opponent_positions = all_positions[self.num_agents:]
+                wp_count = len(self.waypoints_xy)
+                for i in range(self.num_agents):
+                    if not not_collided[i] or opponent_positions.size == 0:
+                        self._has_overtake_gap[i] = False
+                        continue
+
+                    deltas = opponent_positions - all_positions[i]
+                    distances = np.linalg.norm(deltas, axis=1)
+                    min_dist = float(np.min(distances))
+                    if min_dist < self.TRAFFIC_SAFE_DISTANCE:
+                        denom = max(
+                            self.TRAFFIC_SAFE_DISTANCE - self.TRAFFIC_CRITICAL_DISTANCE,
+                            1e-6,
+                        )
+                        pressure = np.clip(
+                            (self.TRAFFIC_SAFE_DISTANCE - min_dist) / denom,
+                            0.0,
+                            1.0,
+                        )
+                        traffic_clearance_r[i] = self.TRAFFIC_CLEARANCE_PENALTY * pressure * pressure
+
+                    nearby = distances < self.OVERTAKE_INTERACTION_DISTANCE
+                    if not nearby.any():
+                        self._has_overtake_gap[i] = False
+                        continue
+
+                    ego_s = self.last_cumulative_distance[i]
+                    gaps = []
+                    for opp_pos in opponent_positions[nearby]:
+                        opp_s, _ = self._project_to_raceline(
+                            opp_pos,
+                            self.last_wp_index[i],
+                            lookahead=wp_count,
+                        )
+                        gap = ego_s - opp_s
+                        if gap > self.raceline_length * 0.5:
+                            gap -= self.raceline_length
+                        elif gap < -self.raceline_length * 0.5:
+                            gap += self.raceline_length
+                        gaps.append(gap)
+
+                    if not gaps:
+                        self._has_overtake_gap[i] = False
+                        continue
+
+                    gap_arr = np.asarray(gaps, dtype=np.float64)
+                    current_gap = float(gap_arr[np.argmin(np.abs(gap_arr))])
+                    safe_gate = np.clip(
+                        (min_dist - self.TRAFFIC_CRITICAL_DISTANCE)
+                        / max(self.TRAFFIC_SAFE_DISTANCE - self.TRAFFIC_CRITICAL_DISTANCE, 1e-6),
+                        0.0,
+                        1.0,
+                    )
+                    if self._has_overtake_gap[i]:
+                        gap_delta = np.clip(current_gap - self._last_overtake_gap[i], 0.0, 4.0)
+                        overtake_progress_r[i] = (
+                            self.OVERTAKE_PROGRESS_REWARD * gap_delta * safe_gate
+                        )
+                        if (
+                            self._last_overtake_gap[i] < -self.PASS_CONFIRM_GAP
+                            and current_gap > self.PASS_CONFIRM_GAP
+                        ):
+                            pass_r[i] = self.PASS_BONUS * safe_gate
+                    self._last_overtake_gap[i] = current_gap
+                    self._has_overtake_gap[i] = True
+        except (KeyError, TypeError, ValueError, IndexError, FloatingPointError):
+            pass
+
+        rewards += traffic_clearance_r
+        rewards += overtake_progress_r
+        rewards += pass_r
 
         rewards_tensor = torch.from_numpy(rewards.astype(np.float32)).unsqueeze(-1)
         avg_reward = rewards.mean()
@@ -1219,6 +1355,10 @@ class D2PPOAgent:
             "steer_rate": float(steer_r.mean()),
             "steer_abs": float(steer_abs_r.mean()),
             "speed_bonus": float(speed_r.mean()),
+            "pace_floor": float(pace_floor_r.mean()),
+            "traffic_clearance": float(traffic_clearance_r.mean()),
+            "overtake_progress": float(overtake_progress_r.mean()),
+            "pass_bonus": float(pass_r.mean()),
         }
 
         return rewards_tensor, avg_reward
@@ -1239,6 +1379,8 @@ class D2PPOAgent:
                 self._was_colliding_wall[i] = False
                 self._was_colliding_agent[i] = False
                 self._last_steer[i] = 0.0
+                self._last_overtake_gap[i] = 0.0
+                self._has_overtake_gap[i] = False
             return
 
         for i in range(self.num_agents):
@@ -1254,6 +1396,8 @@ class D2PPOAgent:
         self._was_colliding_wall[:] = False
         self._was_colliding_agent[:] = False
         self._last_steer[:] = 0.0
+        self._last_overtake_gap[:] = 0.0
+        self._has_overtake_gap[:] = False
 
     def learn(self, collisions, reward, critic_only=False):
         """Advantage-Weighted Diffusion Regression + Diffusion Regulariser.

@@ -185,6 +185,10 @@ class DiffusionMamba2(nn.Module):
             self._conv_state.zero_()
             self._ssm_state.zero_()
         else:
+            agent_idxs = torch.as_tensor(agent_idxs, device=self._conv_state.device, dtype=torch.long).reshape(-1)
+            agent_idxs = agent_idxs[(agent_idxs >= 0) & (agent_idxs < self._conv_state.shape[0])]
+            if agent_idxs.numel() == 0:
+                return
             self._conv_state[agent_idxs] = 0.0
             self._ssm_state[agent_idxs] = 0.0
 
@@ -244,12 +248,17 @@ class DiffusionMamba2(nn.Module):
         # Pre-norm and clamp before Mamba2 step
         projected_normed = self.pre_mamba_norm(projected)
         projected_normed = torch.clamp(projected_normed, -10.0, 10.0)
+        mamba_dtype = next(self.mamba.parameters()).dtype
+        projected_normed = projected_normed.to(dtype=mamba_dtype)
+        conv_state = conv_state.to(dtype=mamba_dtype)
+        ssm_state = ssm_state.to(dtype=mamba_dtype)
 
         # Mamba2 recurrent step: O(1) per timestep, infinite horizon
         # step() expects (B, 1, d_model) input
-        mamba_out, conv_state, ssm_state = self.mamba.step(
-            projected_normed.unsqueeze(1), conv_state, ssm_state
-        )
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            mamba_out, conv_state, ssm_state = self.mamba.step(
+                projected_normed.unsqueeze(1), conv_state, ssm_state
+            )
         mamba_out = torch.nan_to_num(mamba_out, nan=0.0)
         obs_features = self.norm_layer(mamba_out.squeeze(1))
         obs_features = torch.nan_to_num(obs_features, nan=0.0)
@@ -319,9 +328,9 @@ class DiffusionMamba2(nn.Module):
         S = min(S, K)
         if S == K:
             return list(range(K - 1, -1, -1))
-        # Evenly spaced, always including step 0
-        step_size = K / S
-        return [int(round((S - 1 - i) * step_size)) for i in range(S)]
+        # Span the full reverse process. For S=1 this intentionally returns
+        # [K - 1], so one-step DDIM predicts x0 from the noisiest state.
+        return torch.linspace(K - 1, 0, S).round().long().tolist()
 
     @torch.no_grad()
     def ddim_sample_action(self, obs_features, num_steps=None, eta=0.0):

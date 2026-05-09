@@ -305,9 +305,9 @@ class DiffusionLSTM(nn.Module):
         S = min(S, K)
         if S == K:
             return list(range(K - 1, -1, -1))
-        # Evenly spaced, always including step 0
-        step_size = K / S
-        return [int(round((S - 1 - i) * step_size)) for i in range(S)]
+        # Span the full reverse process. For S=1 this intentionally returns
+        # [K - 1], so one-step DDIM predicts x0 from the noisiest state.
+        return torch.linspace(K - 1, 0, S).round().long().tolist()
 
     @torch.no_grad()
     def ddim_sample_action(self, obs_features, num_steps=None, eta=0.0):

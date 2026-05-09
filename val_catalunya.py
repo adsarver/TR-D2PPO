@@ -60,13 +60,13 @@ def main():
         transfer=[args.actor, args.critic],
     )
     if not args.no_deploy:
-        agent.deploy(action_repeat=0, ddim_steps=args.ddim_steps)
+        agent.deploy(action_repeat=args.action_repeat, ddim_steps=args.ddim_steps)
 
     print(f"\n{'='*60}")
     print(f"  Catalunya Validation")
     print(f"  Actor: {args.actor}")
     print(f"  Laps target: {args.laps}, DDIM steps: {args.ddim_steps}, "
-          f"action_repeat: 0")
+            f"action_repeat: {args.action_repeat}")
     print(f"{'='*60}\n")
 
     lap_count = 0

@@ -397,11 +397,18 @@ class TrackGenerator:
         w = total_widths[::step]
         m = len(cl)
 
-        min_gap = 5
+        seg = np.linalg.norm(np.roll(cl, -1, axis=0) - cl, axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg[:-1])])
+        total_length = float(np.sum(seg))
+        if total_length <= 0.0:
+            return False
+
         for i in range(m):
-            for j in range(i + min_gap, m):
-                idx_gap = min(j - i, m - (j - i))
-                if idx_gap < min_gap:
+            for j in range(i + 1, m):
+                arc_gap = abs(s[j] - s[i])
+                arc_gap = min(arc_gap, total_length - arc_gap)
+                local_width = max(float(w[i]), float(w[j]))
+                if arc_gap < max(3.0, 2.5 * local_width):
                     continue
                 dist = math.hypot(
                     cl[i, 0] - cl[j, 0], cl[i, 1] - cl[j, 1])
@@ -477,9 +484,11 @@ class TrackGenerator:
         left_px = to_px(left_boundary)
         right_px = to_px(right_boundary)
 
-        # Wall thickness is doubled: the interior fill (step 2) erases the
-        # inward half, leaving ~wall_width/2 visible outward-facing wall.
-        wall_width = max(6, int(round(0.5 / res)))
+        # Keep walls visible without consuming most of a narrow generated
+        # corridor.  A 0.5 m stroke centered on each boundary leaves only
+        # ~0.3 m free on a 0.8 m track, which makes f110_gym spawn cars in
+        # collision even when the centerline is valid.
+        wall_width = max(3, int(round(0.18 / res)))
         r = wall_width // 2  # radius for joint circles
 
         # Step 1: Draw thick black boundary walls with filled circles at
@@ -501,12 +510,19 @@ class TrackGenerator:
             tw_arr = np.asarray(total_widths, dtype=float)
             center_px = to_px(cl_arr)
             min_rad_px = max(2.0, 0.4 / res)  # never below 0.4 m equiv
+            fill_widths = []
             for (cx, cy), w in zip(center_px, tw_arr):
                 rad = max(min_rad_px, (float(w) / 2.0) / res)
+                fill_widths.append(max(1, int(round(2.0 * rad))))
                 draw.ellipse(
                     [cx - rad, cy - rad, cx + rad, cy + rad],
                     fill=255,
                 )
+            for i in range(len(center_px)):
+                p0 = center_px[i]
+                p1 = center_px[(i + 1) % len(center_px)]
+                width = max(fill_widths[i], fill_widths[(i + 1) % len(center_px)])
+                draw.line([p0, p1], fill=255, width=width)
         else:
             # Backwards-compatible fallback (legacy callers).
             corridor = left_px + list(reversed(right_px))
@@ -522,6 +538,29 @@ class TrackGenerator:
         draw.line(right_px + [right_px[0]], fill=0, width=wall_width)
         for px, py in right_px:
             draw.ellipse([px - r, py - r, px + r, py + r], fill=0)
+
+        # Step 4: Clear a conservative driveable core.  In very tight
+        # corners the offset boundary can loop inward and the final wall
+        # restamp may put isolated black pixels back inside the racing
+        # surface.  Clearing only the center corridor removes those islands
+        # without erasing the visible boundary walls.
+        if centerline is not None and total_widths is not None:
+            cl_arr = np.asarray(centerline, dtype=float)
+            tw_arr = np.asarray(total_widths, dtype=float)
+            center_px = to_px(cl_arr)
+            core_widths = []
+            for w in tw_arr:
+                width_m = min(float(w) * 0.55, max(0.0, float(w) - 0.30))
+                width_m = max(0.45, width_m)
+                core_widths.append(max(1, int(round(width_m / res))))
+            for i in range(len(center_px)):
+                p0 = center_px[i]
+                p1 = center_px[(i + 1) % len(center_px)]
+                width = max(core_widths[i], core_widths[(i + 1) % len(center_px)])
+                draw.line([p0, p1], fill=255, width=width)
+            for (cx, cy), width in zip(center_px, core_widths):
+                r_core = width / 2.0
+                draw.ellipse([cx - r_core, cy - r_core, cx + r_core, cy + r_core], fill=255)
 
         return img, origin, res
 
